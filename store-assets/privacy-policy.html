@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TabFlow — Privacy Policy</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1117;
+      color: #c9cdd8;
+      line-height: 1.7;
+      padding: 40px 20px;
+    }
+    .container {
+      max-width: 680px;
+      margin: 0 auto;
+    }
+    h1 {
+      color: #e2e4eb;
+      font-size: 28px;
+      margin-bottom: 8px;
+    }
+    .updated {
+      color: #6b7084;
+      font-size: 14px;
+      margin-bottom: 32px;
+    }
+    h2 {
+      color: #e2e4eb;
+      font-size: 20px;
+      margin-top: 32px;
+      margin-bottom: 12px;
+    }
+    p {
+      margin-bottom: 16px;
+    }
+    strong {
+      color: #e2e4eb;
+    }
+    a {
+      color: #6c8cff;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>TabFlow — Privacy Policy</h1>
+    <p class="updated">Last updated: April 10, 2026</p>
+
+    <h2>What TabFlow Does</h2>
+    <p>TabFlow is a browser tab manager that organizes your tabs into workspaces. It reads your open tab URLs and titles so it can display and manage them within the extension.</p>
+
+    <h2>Data Stored Locally</h2>
+    <p>All workspace and tab data is stored locally on your device using Chrome's built-in storage APIs (<strong>chrome.storage.local</strong>). This data never leaves your device unless you explicitly enable cloud sync.</p>
+
+    <h2>Cloud Sync (Optional)</h2>
+    <p>If you choose to enable cloud sync, your workspace data is encrypted on your device using AES-GCM encryption <strong>before</strong> it is sent to your own self-hosted Supabase database. The extension developer has no access to your Supabase project or your data. Your encryption passphrase never leaves your device.</p>
+    <p>Cloud sync is entirely optional. TabFlow works fully offline with local-only storage.</p>
+
+    <h2>Data Collected</h2>
+    <p><strong>Web history (tab URLs and titles):</strong> Used solely to display and organize your tabs within the extension. This data is stored locally and, if cloud sync is enabled, encrypted and synced to your own database.</p>
+    <p><strong>No other data is collected.</strong> TabFlow does not collect analytics, telemetry, personal information, browsing behavior, or any data beyond what is needed to manage your tabs.</p>
+
+    <h2>Third-Party Services</h2>
+    <p>TabFlow does not send data to any third-party services. If you enable cloud sync, data is sent only to the Supabase project URL that you configure yourself.</p>
+
+    <h2>No Ads, No Tracking</h2>
+    <p>TabFlow contains no advertisements, no analytics scripts, and no tracking of any kind.</p>
+
+    <h2>Contact</h2>
+    <p>If you have questions about this privacy policy, reach out to the developer directly.</p>
+  </div>
+</body>
+</html>

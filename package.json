@@ -1,0 +1,32 @@
+{
+  "name": "tabflow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-platform browser tab manager",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "build:core": "npm run build -w packages/core",
+    "build:chrome": "npm run build -w packages/chrome-extension",
+    "dev:chrome": "npm run dev -w packages/chrome-extension",
+    "clean": "rm -rf packages/*/dist",
+    "lint": "eslint packages/*/src --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/chrome-extension/tsconfig.json",
+    "test": "npm run test -w packages/core && npm run test -w packages/chrome-extension",
+    "test:smoke": "npm run test:smoke -w packages/chrome-extension"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "eslint": "^9.0.0",
+    "puppeteer-core": "^24.40.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.4"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

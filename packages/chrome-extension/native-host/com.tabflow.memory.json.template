@@ -1,0 +1,9 @@
+{
+  "name": "com.tabflow.memory",
+  "description": "TabFlow memory monitor — reports Chrome process memory usage",
+  "path": "INSTALL_PATH_PLACEHOLDER",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://EXTENSION_ID_PLACEHOLDER/"
+  ]
+}
