@@ -6,7 +6,7 @@
 
 import Dexie, { Table } from 'dexie';
 import { StorageAdapter } from '@tabflow/core';
-import { Workspace, Tab, Session, WorkspaceHistoryEntry } from '@tabflow/core';
+import { Workspace, Tab, Session, WorkspaceHistoryEntry, DeletedWorkspace } from '@tabflow/core';
 
 /**
  * Dexie database definition for TabFlow
@@ -27,6 +27,9 @@ class TabFlowDatabase extends Dexie {
 
   /** Tab thumbnails table (cached webpage screenshots keyed by URL) */
   thumbnails!: Table<{ url: string; dataUrl: string; capturedAt: number }>;
+
+  /** Deleted workspaces archive (recycle bin) */
+  deletedWorkspaces!: Table<DeletedWorkspace>;
 
   constructor() {
     super('tabflow');
@@ -52,6 +55,17 @@ class TabFlowDatabase extends Dexie {
       sessions: '&id, userId',
       workspaceHistory: '&id, workspaceId, [workspaceId+timestamp], timestamp',
       thumbnails: '&url, capturedAt',
+    });
+
+    // v4: Add deleted workspaces archive (recycle bin).
+    // Stores workspace + tabs at time of deletion for restore.
+    this.version(4).stores({
+      workspaces: '&id, userId, sortOrder',
+      tabs: '&id, workspaceId, sortOrder',
+      sessions: '&id, userId',
+      workspaceHistory: '&id, workspaceId, [workspaceId+timestamp], timestamp',
+      thumbnails: '&url, capturedAt',
+      deletedWorkspaces: '&id, deletedAt',
     });
   }
 }
@@ -263,6 +277,46 @@ class IndexedDBStorageAdapter implements StorageAdapter {
     const urls = oldest.map((e) => e.url);
     await this.db.thumbnails.bulkDelete(urls);
     return urls.length;
+  }
+
+  // ==================== DELETED WORKSPACES (ARCHIVE) OPERATIONS ====================
+
+  /**
+   * Archives a deleted workspace with its tabs for later restoration.
+   */
+  async archiveWorkspace(entry: DeletedWorkspace): Promise<void> {
+    await this.db.deletedWorkspaces.put(entry);
+  }
+
+  /**
+   * Gets all archived (deleted) workspaces, newest deletion first.
+   */
+  async getDeletedWorkspaces(): Promise<DeletedWorkspace[]> {
+    return this.db.deletedWorkspaces
+      .orderBy('deletedAt')
+      .reverse()
+      .toArray();
+  }
+
+  /**
+   * Removes an archived workspace permanently (empties from recycle bin).
+   */
+  async permanentlyDeleteWorkspace(id: string): Promise<void> {
+    await this.db.deletedWorkspaces.delete(id);
+  }
+
+  /**
+   * Prunes archived workspaces older than the given date.
+   * Called periodically to prevent unbounded growth (e.g. 90-day retention).
+   */
+  async pruneDeletedWorkspaces(olderThan: Date): Promise<number> {
+    const entries = await this.db.deletedWorkspaces
+      .where('deletedAt')
+      .below(olderThan)
+      .toArray();
+    const ids = entries.map((e) => e.id);
+    await this.db.deletedWorkspaces.bulkDelete(ids);
+    return ids.length;
   }
 
   // ==================== SESSION OPERATIONS ====================

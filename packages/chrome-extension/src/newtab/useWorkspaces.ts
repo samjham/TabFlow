@@ -13,7 +13,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { MessageType } from '../background/MessageHandler';
-import type { Workspace, Tab, WorkspaceHistoryEntry } from '@tabflow/core';
+import type { Workspace, Tab, WorkspaceHistoryEntry, DeletedWorkspace } from '@tabflow/core';
 
 /** Workspace with its tab count for display */
 export interface WorkspaceWithCount extends Workspace {
@@ -49,6 +49,9 @@ export interface UseWorkspacesReturn {
   searchAllWorkspaces: (query: string) => Promise<SearchResult[]>;
   closeAllTabs: (workspaceId: string) => Promise<void>;
   reorderTabs: (orderedTabIds: string[]) => Promise<void>;
+  getDeletedWorkspaces: () => Promise<DeletedWorkspace[]>;
+  restoreDeletedWorkspaces: (archiveIds: string[]) => Promise<void>;
+  permanentlyDeleteWorkspaces: (archiveIds: string[]) => Promise<void>;
   refresh: () => Promise<void>;
 }
 
@@ -379,6 +382,42 @@ export function useWorkspaces(): UseWorkspacesReturn {
     [refresh]
   );
 
+  const getDeletedWorkspaces = useCallback(
+    async (): Promise<DeletedWorkspace[]> => {
+      try {
+        return await sendMessage<DeletedWorkspace[]>(MessageType.GET_DELETED_WORKSPACES);
+      } catch (err) {
+        return [];
+      }
+    },
+    []
+  );
+
+  const restoreDeletedWorkspaces = useCallback(
+    async (archiveIds: string[]) => {
+      try {
+        await sendMessage(MessageType.RESTORE_DELETED_WORKSPACES, { archiveIds });
+        await refresh();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to restore workspaces');
+        throw err;
+      }
+    },
+    [refresh]
+  );
+
+  const permanentlyDeleteWorkspaces = useCallback(
+    async (archiveIds: string[]) => {
+      try {
+        await sendMessage(MessageType.PERMANENTLY_DELETE_WORKSPACES, { archiveIds });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to permanently delete workspaces');
+        throw err;
+      }
+    },
+    []
+  );
+
   return {
     workspaces,
     activeWorkspace,
@@ -401,6 +440,9 @@ export function useWorkspaces(): UseWorkspacesReturn {
     restoreHistoryEntry,
     searchAllWorkspaces,
     reorderTabs,
+    getDeletedWorkspaces,
+    restoreDeletedWorkspaces,
+    permanentlyDeleteWorkspaces,
     refresh,
   };
 }

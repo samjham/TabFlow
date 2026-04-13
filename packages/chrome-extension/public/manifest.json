@@ -1,11 +1,10 @@
 {
   "manifest_version": 3,
   "name": "TabFlow",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Organize your tabs into workspaces. Save, restore, and sync across devices.",
   "permissions": [
     "tabs",
-    "tabGroups",
     "storage",
     "activeTab",
     "sidePanel",

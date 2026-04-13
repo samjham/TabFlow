@@ -39,7 +39,7 @@ function formatBytes(bytes: number): string {
 }
 
 export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
-  const { workspaces, activeWorkspace, tabs, loading, error, createWorkspace, deleteWorkspace, switchWorkspace, renameWorkspace, changeWorkspaceColor, changeShortName, reorderWorkspaces, removeTab, removeTabs, moveTabs, duplicateTabs, closeAllTabs, getWorkspaceHistory, restoreHistoryEntry, searchAllWorkspaces, reorderTabs } = useWorkspaces();
+  const { workspaces, activeWorkspace, tabs, loading, error, createWorkspace, deleteWorkspace, switchWorkspace, renameWorkspace, changeWorkspaceColor, changeShortName, reorderWorkspaces, removeTab, removeTabs, moveTabs, duplicateTabs, closeAllTabs, getWorkspaceHistory, restoreHistoryEntry, searchAllWorkspaces, reorderTabs, getDeletedWorkspaces, restoreDeletedWorkspaces, permanentlyDeleteWorkspaces } = useWorkspaces();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showNewWorkspaceForm, setShowNewWorkspaceForm] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
@@ -83,6 +83,12 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
   const [workspaceStats, setWorkspaceStats] = useState<Record<string, WorkspaceStats>>({});
   const [systemMemory, setSystemMemory] = useState<{ total: number; available: number }>({ total: 0, available: 0 });
   const [chromeMemory, setChromeMemory] = useState<number>(0);
+
+  // ─── Deleted workspaces archive (recycle bin) ───
+  const [showArchivePanel, setShowArchivePanel] = useState(false);
+  const [deletedWorkspaces, setDeletedWorkspaces] = useState<any[]>([]);
+  const [selectedArchiveIds, setSelectedArchiveIds] = useState<Set<string>>(new Set());
+  const [archiveLoading, setArchiveLoading] = useState(false);
 
   // ─── Multi-device sync: "Resume Working Here" ───
   const [isActiveDevice, setIsActiveDevice] = useState(true);
@@ -748,12 +754,73 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
   }, [activeWorkspace?.id]);
 
   const handleDeleteWorkspace = async (workspaceId: string) => {
-    if (confirm('Are you sure you want to delete this workspace? This action cannot be undone.')) {
+    if (confirm('Delete this workspace? You can restore it later from the Archive.')) {
       try {
         await deleteWorkspace(workspaceId);
+        // Refresh archive if the panel is open
+        if (showArchivePanel) {
+          const deleted = await getDeletedWorkspaces();
+          setDeletedWorkspaces(deleted);
+        }
       } catch (err) {
         // Error is handled by the hook
       }
+    }
+  };
+
+  const handleToggleArchive = async () => {
+    if (!showArchivePanel) {
+      setArchiveLoading(true);
+      setShowArchivePanel(true);
+      try {
+        const deleted = await getDeletedWorkspaces();
+        setDeletedWorkspaces(deleted);
+      } catch (err) {
+        console.error('Failed to load deleted workspaces:', err);
+      } finally {
+        setArchiveLoading(false);
+      }
+    } else {
+      setShowArchivePanel(false);
+      setSelectedArchiveIds(new Set());
+    }
+  };
+
+  const handleToggleArchiveSelection = (archiveId: string) => {
+    setSelectedArchiveIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(archiveId)) {
+        next.delete(archiveId);
+      } else {
+        next.add(archiveId);
+      }
+      return next;
+    });
+  };
+
+  const handleRestoreSelected = async () => {
+    if (selectedArchiveIds.size === 0) return;
+    try {
+      await restoreDeletedWorkspaces(Array.from(selectedArchiveIds));
+      setSelectedArchiveIds(new Set());
+      // Refresh the archive list
+      const deleted = await getDeletedWorkspaces();
+      setDeletedWorkspaces(deleted);
+    } catch (err) {
+      // Error handled by hook
+    }
+  };
+
+  const handlePermanentlyDeleteSelected = async () => {
+    if (selectedArchiveIds.size === 0) return;
+    if (!confirm(`Permanently delete ${selectedArchiveIds.size} workspace(s)? This cannot be undone.`)) return;
+    try {
+      await permanentlyDeleteWorkspaces(Array.from(selectedArchiveIds));
+      setSelectedArchiveIds(new Set());
+      const deleted = await getDeletedWorkspaces();
+      setDeletedWorkspaces(deleted);
+    } catch (err) {
+      // Error handled by hook
     }
   };
 
@@ -904,12 +971,116 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
           )}
         </div>
 
-        {/* Archive Section (placeholder) */}
+        {/* Archive Section (Recycle Bin) */}
         <div style={styles.archiveSection}>
           <div style={styles.spacesHeader}>
-            <h2 style={styles.spacesTitle}>Archive</h2>
+            <h2
+              style={{ ...styles.spacesTitle, cursor: 'pointer', userSelect: 'none' as const }}
+              onClick={handleToggleArchive}
+              title={showArchivePanel ? 'Hide deleted workspaces' : 'Show deleted workspaces'}
+            >
+              {showArchivePanel ? '▾' : '▸'} Archive
+            </h2>
           </div>
-          <div style={styles.emptyArchive}>No archived workspaces</div>
+          {showArchivePanel && (
+            <div style={{ padding: '0 12px 8px' }}>
+              {archiveLoading ? (
+                <div style={{ color: '#6b7084', fontSize: '12px', padding: '8px 0' }}>Loading...</div>
+              ) : deletedWorkspaces.length === 0 ? (
+                <div style={{ color: '#6b7084', fontSize: '12px', padding: '8px 0' }}>No deleted workspaces</div>
+              ) : (
+                <>
+                  <div style={{ maxHeight: '200px', overflowY: 'auto' as const, marginBottom: '8px' }}>
+                    {deletedWorkspaces.map((dw) => (
+                      <label
+                        key={dw.id}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '8px',
+                          padding: '6px 4px',
+                          borderRadius: '6px',
+                          cursor: 'pointer',
+                          fontSize: '13px',
+                          color: '#c9cdd8',
+                          backgroundColor: selectedArchiveIds.has(dw.id) ? 'rgba(108, 140, 255, 0.15)' : 'transparent',
+                        }}
+                        onMouseEnter={(e) => {
+                          if (!selectedArchiveIds.has(dw.id)) {
+                            (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255,255,255,0.05)';
+                          }
+                        }}
+                        onMouseLeave={(e) => {
+                          (e.currentTarget as HTMLElement).style.backgroundColor = selectedArchiveIds.has(dw.id) ? 'rgba(108, 140, 255, 0.15)' : 'transparent';
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedArchiveIds.has(dw.id)}
+                          onChange={() => handleToggleArchiveSelection(dw.id)}
+                          style={{ accentColor: '#6c8cff', flexShrink: 0 }}
+                        />
+                        <div
+                          style={{
+                            width: '10px',
+                            height: '10px',
+                            borderRadius: '50%',
+                            backgroundColor: dw.workspace?.color || '#6c8cff',
+                            flexShrink: 0,
+                          }}
+                        />
+                        <div style={{ overflow: 'hidden', flex: 1, minWidth: 0 }}>
+                          <div style={{ whiteSpace: 'nowrap' as const, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {dw.workspace?.name || 'Unnamed'}
+                          </div>
+                          <div style={{ fontSize: '11px', color: '#6b7084' }}>
+                            {dw.tabs?.length || 0} tab{(dw.tabs?.length || 0) !== 1 ? 's' : ''} · {new Date(dw.deletedAt).toLocaleDateString()}
+                          </div>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                  {selectedArchiveIds.size > 0 && (
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                      <button
+                        onClick={handleRestoreSelected}
+                        style={{
+                          flex: 1,
+                          padding: '6px 10px',
+                          borderRadius: '6px',
+                          border: 'none',
+                          background: '#6c8cff',
+                          color: '#fff',
+                          fontSize: '12px',
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                        }}
+                        title="Restore selected workspaces"
+                      >
+                        Restore ({selectedArchiveIds.size})
+                      </button>
+                      <button
+                        onClick={handlePermanentlyDeleteSelected}
+                        style={{
+                          padding: '6px 10px',
+                          borderRadius: '6px',
+                          border: '1px solid rgba(255, 107, 157, 0.3)',
+                          background: 'transparent',
+                          color: '#ff6b9d',
+                          fontSize: '12px',
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                        }}
+                        title="Permanently delete selected"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Footer - User Info */}

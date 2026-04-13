@@ -118,6 +118,28 @@ export interface WorkspaceHistoryEntry {
 }
 
 /**
+ * Represents a deleted workspace stored in the archive/recycle bin.
+ * Contains the full workspace data and its tabs at the time of deletion,
+ * so it can be fully restored later.
+ */
+export interface DeletedWorkspace {
+  /** Unique identifier for this archive entry */
+  id: string;
+  /** The workspace data at the time of deletion */
+  workspace: Workspace;
+  /** All tabs that were in this workspace when it was deleted */
+  tabs: Array<{
+    url: string;
+    title: string;
+    faviconUrl?: string;
+    sortOrder: number;
+    isPinned: boolean;
+  }>;
+  /** When the workspace was deleted */
+  deletedAt: Date;
+}
+
+/**
  * Represents a sync event for real-time collaboration and persistence.
  * Describes changes to be synchronized across clients or stored remotely.
  */

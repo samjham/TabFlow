@@ -43,6 +43,9 @@ export enum MessageType {
   GET_THUMBNAILS = 'GET_THUMBNAILS',
   REORDER_TABS = 'REORDER_TABS',
   DUPLICATE_TABS = 'DUPLICATE_TABS',
+  GET_DELETED_WORKSPACES = 'GET_DELETED_WORKSPACES',
+  RESTORE_DELETED_WORKSPACES = 'RESTORE_DELETED_WORKSPACES',
+  PERMANENTLY_DELETE_WORKSPACES = 'PERMANENTLY_DELETE_WORKSPACES',
 }
 
 /**
@@ -148,6 +151,12 @@ export class MessageHandler {
           return { success: false, error: 'GET_THUMBNAILS must be handled by service worker' };
         case MessageType.REORDER_TABS:
           return await this.handleReorderTabs(message.payload);
+        case MessageType.GET_DELETED_WORKSPACES:
+          return await this.handleGetDeletedWorkspaces();
+        case MessageType.RESTORE_DELETED_WORKSPACES:
+          return await this.handleRestoreDeletedWorkspaces(message.payload);
+        case MessageType.PERMANENTLY_DELETE_WORKSPACES:
+          return await this.handlePermanentlyDeleteWorkspaces(message.payload);
         default:
           return { success: false, error: `Unknown message type: ${(message as any).type}` };
       }
@@ -226,8 +235,8 @@ export class MessageHandler {
   }
 
   /**
-   * Delete a workspace and all its tabs
-   * If it was the active workspace, switch to another one
+   * Delete a workspace — archives it to the recycle bin first so it can be restored.
+   * If it was the active workspace, switch to another one.
    */
   private async handleDeleteWorkspace(payload: any): Promise<Response> {
     const { workspaceId } = payload || {};
@@ -238,6 +247,27 @@ export class MessageHandler {
 
     if (!deletingWorkspace) {
       return { success: false, error: 'Workspace not found' };
+    }
+
+    // Archive the workspace and its tabs before deleting
+    try {
+      const tabs = await this.storage.getTabs(workspaceId);
+      const archiveEntry = {
+        id: `deleted-${workspaceId}-${Date.now()}`,
+        workspace: { ...deletingWorkspace },
+        tabs: tabs.map((t) => ({
+          url: t.url,
+          title: t.title,
+          faviconUrl: t.faviconUrl,
+          sortOrder: t.sortOrder,
+          isPinned: t.isPinned,
+        })),
+        deletedAt: new Date(),
+      };
+      await (this.storage as any).archiveWorkspace(archiveEntry);
+      console.log(`[TabFlow] Archived workspace ${workspaceId} to recycle bin`);
+    } catch (err) {
+      console.warn('[TabFlow] Failed to archive workspace (proceeding with delete):', err);
     }
 
     // Clean up any hidden window for this workspace
@@ -1002,5 +1032,110 @@ export class MessageHandler {
       console.error('[TabFlow] ACTIVATE_TAB_BY_URL error:', err);
       return { success: true, data: { found: false } };
     }
+  }
+
+  // ==================== DELETED WORKSPACES (ARCHIVE) HANDLERS ====================
+
+  /**
+   * Get all archived (deleted) workspaces.
+   */
+  private async handleGetDeletedWorkspaces(): Promise<Response> {
+    try {
+      const deleted = await (this.storage as any).getDeletedWorkspaces();
+      return { success: true, data: deleted || [] };
+    } catch (err) {
+      console.error('[TabFlow] Failed to get deleted workspaces:', err);
+      return { success: true, data: [] };
+    }
+  }
+
+  /**
+   * Restore selected deleted workspaces from the archive.
+   * Recreates the workspace and all its tabs in storage.
+   */
+  private async handleRestoreDeletedWorkspaces(payload: any): Promise<Response> {
+    const { archiveIds } = payload || {};
+    if (!archiveIds || !Array.isArray(archiveIds) || archiveIds.length === 0) {
+      return { success: false, error: 'archiveIds is required (array of archive entry IDs)' };
+    }
+
+    const storageAny = this.storage as any;
+    const allDeleted = await storageAny.getDeletedWorkspaces();
+    let restoredCount = 0;
+
+    // Get existing workspaces to determine max sortOrder
+    const existingWorkspaces = await this.engine.getWorkspaces(LOCAL_USER_ID);
+    let maxSortOrder = existingWorkspaces.reduce(
+      (max, ws) => Math.max(max, ws.sortOrder),
+      -1
+    );
+
+    for (const archiveId of archiveIds) {
+      const entry = allDeleted.find((d: any) => d.id === archiveId);
+      if (!entry) continue;
+
+      // Generate a new ID for the restored workspace (avoid collisions)
+      const newWorkspaceId = crypto.randomUUID();
+      maxSortOrder += 1;
+
+      // Recreate the workspace
+      const restoredWorkspace = {
+        ...entry.workspace,
+        id: newWorkspaceId,
+        isActive: false,
+        sortOrder: maxSortOrder,
+        updatedAt: new Date(),
+        version: 1,
+      };
+      await this.storage.saveWorkspace(restoredWorkspace);
+
+      // Recreate all tabs
+      for (const tab of entry.tabs) {
+        const newTab = {
+          id: crypto.randomUUID(),
+          workspaceId: newWorkspaceId,
+          url: tab.url,
+          title: tab.title,
+          faviconUrl: tab.faviconUrl,
+          sortOrder: tab.sortOrder,
+          isPinned: tab.isPinned,
+          lastAccessed: new Date(),
+          updatedAt: new Date(),
+        };
+        await this.storage.saveTab(newTab);
+      }
+
+      // Remove from archive
+      await storageAny.permanentlyDeleteWorkspace(archiveId);
+      restoredCount++;
+      console.log(`[TabFlow] Restored workspace "${entry.workspace.name}" as ${newWorkspaceId}`);
+    }
+
+    return { success: true, data: { restoredCount } };
+  }
+
+  /**
+   * Permanently delete selected workspaces from the archive (empty recycle bin).
+   */
+  private async handlePermanentlyDeleteWorkspaces(payload: any): Promise<Response> {
+    const { archiveIds } = payload || {};
+    if (!archiveIds || !Array.isArray(archiveIds) || archiveIds.length === 0) {
+      return { success: false, error: 'archiveIds is required' };
+    }
+
+    const storageAny = this.storage as any;
+    let deletedCount = 0;
+
+    for (const archiveId of archiveIds) {
+      try {
+        await storageAny.permanentlyDeleteWorkspace(archiveId);
+        deletedCount++;
+      } catch (err) {
+        console.warn(`[TabFlow] Failed to permanently delete archive ${archiveId}:`, err);
+      }
+    }
+
+    console.log(`[TabFlow] Permanently deleted ${deletedCount} archived workspace(s)`);
+    return { success: true, data: { deletedCount } };
   }
 }

@@ -4,7 +4,7 @@
  */
 
 // Models and types
-export type { User, Workspace, Tab, Session, WorkspaceSnapshot, WorkspaceHistoryEntry, SyncEvent } from './models/types';
+export type { User, Workspace, Tab, Session, WorkspaceSnapshot, WorkspaceHistoryEntry, DeletedWorkspace, SyncEvent } from './models/types';
 
 // Storage
 export type { StorageAdapter } from './storage/StorageAdapter';

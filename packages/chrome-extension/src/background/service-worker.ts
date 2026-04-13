@@ -580,6 +580,8 @@ const HISTORY_PRUNE_ALARM_NAME = 'tabflow-history-prune';
 
 /** 30 days in milliseconds */
 const HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** 90 days for deleted workspace archive retention */
+const ARCHIVE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
 // Create a recurring alarm to prune old workspace history entries.
 // periodInMinutes: 1440 = once per day. MV3 may throttle, but daily is fine.
@@ -601,6 +603,16 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       const prunedThumbs = await storage.pruneThumbnails(500);
       if (prunedThumbs > 0) {
         console.log(`[TabFlow] Pruned ${prunedThumbs} old thumbnails`);
+      }
+      // Prune deleted workspaces older than 90 days
+      try {
+        const archiveCutoff = new Date(Date.now() - ARCHIVE_RETENTION_MS);
+        const prunedArchive = await storage.pruneDeletedWorkspaces(archiveCutoff);
+        if (prunedArchive > 0) {
+          console.log(`[TabFlow] Pruned ${prunedArchive} archived workspaces older than 90 days`);
+        }
+      } catch (archiveErr) {
+        console.warn('[TabFlow] Error pruning archived workspaces:', archiveErr);
       }
     } catch (err) {
       console.warn('[TabFlow] Error pruning history/thumbnails:', err);
