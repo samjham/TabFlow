@@ -50,21 +50,26 @@ Browser Tab Manager Project/
     │       ├── workspace/WorkspaceEngine.ts
     │       ├── sync/SyncClient.ts
     │       └── crypto/encryption.ts
-    ├── chrome-extension/           ← @tabflow/chrome-extension — the MV3 extension itself
-    │   ├── public/manifest.json    ← permissions, icons, entry points
+    ├── browser-extension/          ← @tabflow/browser-extension — cross-browser MV3 extension (Chrome + Firefox)
+    │   ├── public/
+    │   │   ├── manifest.chrome.json   ← Chrome manifest template (copied in as manifest.json during build)
+    │   │   ├── manifest.firefox.json  ← Firefox manifest template (gecko id, sidebar_action, etc.)
+    │   │   └── icons/              ← copied into each dist at build time
+    │   ├── vite.config.ts          ← TARGET env var picks the manifest and emits to dist/<target>/
     │   └── src/
     │       ├── background/         ← service worker, MessageHandler, TabManager
     │       ├── newtab/             ← main UI (NewTab.tsx + useWorkspaces hook)
     │       ├── popup/              ← toolbar popup
-    │       ├── sidebar/            ← side-panel entry
+    │       ├── sidebar/            ← sidePanel (Chrome) / sidebarAction (Firefox) entry
     │       ├── storage/            ← IndexedDBAdapter (Dexie.js) — source of truth
     │       ├── sync/               ← SupabaseSyncClient
     │       ├── auth/               ← AuthManager + SetupWizard
     │       ├── components/         ← shared React components
     │       ├── content/            ← content scripts (youtube-time-tracker)
     │       ├── entries/            ← HTML entry points
+    │       ├── browser-compat.ts   ← runtime/build-time browser detection + sidebar API wrapper
     │       └── config.ts           ← Supabase config loader (async from chrome.storage.local)
-    ├── native-host/                ← optional native-messaging companion
+    ├── native-host/                ← optional native-messaging companion (install.bat for Chrome, install-firefox.bat for Firefox)
     └── supabase/                   ← SQL migrations + setup script
         ├── migrations/
         │   ├── 001_init.sql
@@ -91,7 +96,7 @@ These are principles Sam has explicitly set. **Violating them causes real proble
 
 ### 3.2. Be specific about file paths
 
-Sam has explicitly asked: don't assume the user knows where things are. When instructing Sam to make a change or open something, give the **full path**. Example: say `C:\Users\shamilton\OneDrive - vortexgov\Documents\Claude\Browser Tab Manager Project` or `packages/chrome-extension/src/newtab/NewTab.tsx`, not "the newtab file."
+Sam has explicitly asked: don't assume the user knows where things are. When instructing Sam to make a change or open something, give the **full path**. Example: say `C:\Users\shamilton\OneDrive - vortexgov\Documents\Claude\Browser Tab Manager Project` or `packages/browser-extension/src/newtab/NewTab.tsx`, not "the newtab file."
 
 ### 3.3. Storage is the source of truth, not Chrome
 
@@ -108,9 +113,10 @@ The model is: **IndexedDB is truth.** Tab event listeners update IndexedDB. The 
 | Encryption | AES-GCM via WebCrypto, derived from passphrase | Data at rest in Supabase is opaque to the Supabase host |
 | Multi-device model | **"Resume Working Here"** — one active device at a time | Avoids merge conflicts; heartbeat-based claim with 2-min stale detection |
 | UI framework | React 18 with inline `style={}` objects (no CSS framework) | Kept bundle small; each screen manages its own styles |
-| Build | Vite (for extension), tsc (for core) | Fast dev, clean output |
-| Entry point | The new tab page IS the app | `chrome_url_overrides.newtab` → newtab.html |
+| Build | Vite (for extension), tsc (for core); `TARGET=chrome\|firefox` env var selects manifest and emits to `dist/<target>/` | Single source, two browsers |
+| Entry point | The new tab page IS the app | `chrome_url_overrides.newtab` → newtab.html (works on both Chrome and Firefox) |
 | New tab activation | User action only | Background never opens new tabs unprompted |
+| Cross-browser | Single codebase targets Chrome + Firefox (MV3) | See §5.7 browser-compat shim |
 
 ---
 
@@ -118,7 +124,7 @@ The model is: **IndexedDB is truth.** Tab event listeners update IndexedDB. The 
 
 ### 5.1. Message layer (background ↔ UI)
 
-All UI → background communication goes through `chrome.runtime.sendMessage` with a typed `MessageType` enum in `packages/chrome-extension/src/background/MessageHandler.ts`. When adding a feature:
+All UI → background communication goes through `chrome.runtime.sendMessage` with a typed `MessageType` enum in `packages/browser-extension/src/background/MessageHandler.ts`. When adding a feature:
 
 1. Add a new `MessageType` enum value
 2. Add a case in `handleMessage`'s switch
@@ -128,7 +134,7 @@ All UI → background communication goes through `chrome.runtime.sendMessage` wi
 
 ### 5.2. Storage schema versions (Dexie)
 
-`packages/chrome-extension/src/storage/IndexedDBAdapter.ts`:
+`packages/browser-extension/src/storage/IndexedDBAdapter.ts`:
 
 - **v1:** `workspaces`, `tabs`, `sessions`
 - **v2:** Added `workspaceHistory` (per-workspace tab snapshots, 30-day retention)
@@ -151,7 +157,7 @@ Flow:
 
 ### 5.4. Onboarding (SetupWizard)
 
-`packages/chrome-extension/src/auth/SetupWizard.tsx`. Three paths:
+`packages/browser-extension/src/auth/SetupWizard.tsx`. Three paths:
 
 1. **Skip (local-only):** Sets `tabflow_local_only: true` in chrome.storage.local. No Supabase at all.
 2. **Already have Supabase account:** Jump to credential entry form → test connection → success.
@@ -167,6 +173,31 @@ When a workspace is deleted (`handleDeleteWorkspace`), it first archives to the 
 
 Separate from the archive. On every meaningful tab change, the service worker takes a snapshot of the workspace's tabs (URL list dedup'd). Stored in `workspaceHistory`. UI: `showHistoryPanel` slider on NewTab lets the user scrub through history and restore. 30-day retention.
 
+### 5.7. Cross-browser support (Chrome + Firefox)
+
+The extension is built from a single source tree in `packages/browser-extension/` and targets both Chrome and Firefox via a build flag:
+
+- `TARGET=chrome vite build` → `dist/chrome/` with `manifest.chrome.json` copied in as `manifest.json`
+- `TARGET=firefox vite build` → `dist/firefox/` with `manifest.firefox.json` copied in as `manifest.json`
+
+Picked in `packages/browser-extension/vite.config.ts` via the `postBuild` plugin. `publicDir` is left enabled (so `icons/` and `suspended.*` get copied) and the stray `manifest.<target>.json` templates are stripped out of the final dist by the same plugin.
+
+Firefox manifest differences (`public/manifest.firefox.json`):
+- Adds `browser_specific_settings.gecko.id` + `strict_min_version: 128.0` (FF 128 is when MV3 service_worker support landed)
+- Removes Chrome-only permissions `sidePanel` and `system.memory`
+- Replaces `side_panel` key with `sidebar_action`
+- Everything else identical (including `chrome_url_overrides.newtab` — Firefox supports this, with a one-time user permission prompt)
+
+Runtime compatibility is handled by `packages/browser-extension/src/browser-compat.ts`:
+- Firefox exposes `chrome` as an alias for `browser`, so existing `chrome.*` calls mostly just work
+- The few Chrome-only APIs (`chrome.sidePanel`, `chrome.system?.memory`) are already guarded with feature checks in `service-worker.ts`, so they no-op on Firefox
+- `browserCompat.openSidebar(tabId?)` wraps `chrome.sidePanel.open()` / `browser.sidebarAction.open()` so UI code doesn't have to branch
+- Vite's `define` injects `import.meta.env.TARGET_BROWSER` (`'chrome'` or `'firefox'`) so source code can check the build target
+
+Native messaging (`packages/native-host/`) has separate installers because the registration differs:
+- Chrome: `install.bat` → writes to `HKCU\Software\Google\Chrome\NativeMessagingHosts`, uses `allowed_origins: ["chrome-extension://<ID>/"]`
+- Firefox: `install-firefox.bat` → writes to `HKCU\Software\Mozilla\NativeMessagingHosts`, uses `allowed_extensions: ["<gecko-id>"]`
+
 ---
 
 ## 6. Build & Run
@@ -175,10 +206,14 @@ Separate from the archive. On every meaningful tab change, the service worker ta
 # Install
 npm install
 
-# Build everything
+# Build both browsers (produces dist/chrome and dist/firefox)
 npm run build
 
-# Dev mode (Chrome extension only)
+# Build one target
+npm run build:chrome
+npm run build:firefox
+
+# Dev mode (defaults to chrome target; for Firefox use build:firefox + `web-ext run`)
 npm run dev:chrome
 
 # Typecheck
@@ -194,12 +229,21 @@ To load unpacked in Chrome:
 1. `chrome://extensions`
 2. Toggle Developer mode on (top right)
 3. Click **Load unpacked**
-4. Select `packages/chrome-extension/dist`
+4. Select `packages/browser-extension/dist/chrome`
 
-To build a zip for Chrome Web Store upload:
+To load temporarily in Firefox (does not persist across restarts):
+
+1. Open `about:debugging#/runtime/this-firefox`
+2. Click **Load Temporary Add-on…**
+3. Select `packages/browser-extension/dist/firefox/manifest.json`
+
+To build zips for store upload:
 
 ```bash
-cd packages/chrome-extension/dist && zip -r ../../../tabflow-extension.zip .
+# Chrome Web Store
+cd packages/browser-extension/dist/chrome && zip -r ../../../../tabflow-chrome.zip .
+# Firefox (addons.mozilla.org)
+cd packages/browser-extension/dist/firefox && zip -r ../../../../tabflow-firefox.zip .
 ```
 
 ---
@@ -239,6 +283,20 @@ Keep this document tight. It's for quickly onboarding a new Claude — not a ful
 
 ## 10. Changelog (most recent first)
 
+- **2026-04-13** — Stale `tabFlowTabId` collision fix in `packages/browser-extension/src/background/service-worker.ts` (`ensureTabFlowTab`, Strategy 3). After a full Chrome restart, Chrome reassigns every tab a fresh numeric ID, so the `tabFlowTabId` persisted in `chrome.storage.local` from the previous session can now coincidentally point to a completely unrelated tab — notably `chrome://extensions`, which is commonly open during unpacked-install development when the extension reloads. The old Strategy 3 matched purely on ID and handed the tab straight to the pin/move logic, which would then pin `chrome://extensions` at index 0 and never route to the real TabFlow newtab. Strategies 1/2/4/5 didn't save us because on a cold service-worker wake-up the TabFlow tab often hasn't been re-created yet. Fix: Strategy 3 now validates the candidate tab's URL before trusting the stored ID — accepts only `chrome-extension://<extensionId>/…` (URL or `pendingUrl`), `chrome://newtab/` / `chrome://newtab`, empty string, or `about:blank`, and explicitly rejects `suspendedPrefix`. If the candidate doesn't match, the stale ID is removed from `chrome.storage.local` so subsequent runs don't keep hitting the same collision, and the function falls through to Strategies 4/5 which correctly locate (or create) the real keeper. No schema changes, no behavior change on the happy path.
+- **2026-04-13** — Data-loss safeguards added after the folder-rename incident permanently destroyed a user's local workspaces (new extension ID → empty IndexedDB; cloud rows present but undecryptable because the encryption salt was only ever stored in chrome.storage.local and had been GC'd by Chrome). Three defenses now ship together in version **0.1.2**:
+  1. **Pinned extension ID.** `packages/browser-extension/public/manifest.chrome.json` now includes a `key` field (RSA 2048 public key, base64-encoded). The extension ID is now derived from this key, NOT the folder path, so future folder renames will reuse the same ID and the same IndexedDB. Private key was generated with `openssl genrsa 2048` and intentionally NOT committed — losing it only means a future keypair swap requires unpacked-install users to re-import, it doesn't affect cloud data.
+  2. **Salt backup to Supabase.** The `user_settings` table gained a `canary text` column (migration applied in `packages/supabase/tabflow-setup.sql` and the embedded `SETUP_SQL` constant in `packages/browser-extension/src/auth/SetupWizard.tsx` — both use `ADD COLUMN IF NOT EXISTS` for idempotency). `initializeSync()` in `packages/browser-extension/src/background/service-worker.ts` now queries `user_settings` BEFORE deriving a key: if a row exists, its `encryption_salt` is treated as the source of truth and mirrored into local storage; if no row exists, the local salt (or a freshly generated one) is pushed up and becomes authoritative. This means any device signing in with the correct passphrase will derive the same key regardless of local storage state.
+  3. **Canary verification.** On first-run, `initializeSync()` encrypts the fixed string `'tabflow-canary-v1'` with the derived key and stores it in `user_settings.canary`. On every subsequent sign-in, it attempts to decrypt the canary; on `DOMException` (wrong key) it aborts — `syncClient` is NOT created, nothing is pushed — and writes a `passphraseMismatch` record to `chrome.storage.session`. A new red error banner at the top of `NewTab.tsx` (styled via `mismatchBanner` / `mismatchBannerContent` / `mismatchBannerText`) surfaces the message and instructs the user to sign out and re-enter the original passphrase. Legacy rows without a canary are backfilled automatically on next sign-in. This closes the "quietly overwrite cloud data with garbage encrypted with the wrong key" failure mode that made the incident unrecoverable.
+  New import in service-worker.ts: `import { encrypt, decrypt } from '@tabflow/core/crypto/encryption'`. New constant `CANARY_PLAINTEXT = 'tabflow-canary-v1'` (do not change — changing it invalidates every existing user's canary).
+- **2026-04-13** — One-time "Restore from Cloud" button added to recover local state after the `packages/chrome-extension` → `packages/browser-extension` rename orphaned the old unpacked install (new folder path → new extension ID → fresh empty IndexedDB; data was safe on Supabase but locally invisible). Wiring: new `RESTORE_FROM_CLOUD` message type handled in `packages/browser-extension/src/background/service-worker.ts` — calls the existing (previously-dormant) `SupabaseSyncClient.pullAll(syncUserId)`, which fetches every `workspaces` / `tabs` row for the user, decrypts `name` / `url` / `title` with the passphrase-derived key, and upserts them into IndexedDB via `StorageAdapter.saveWorkspace` / `saveTab`. Sets `setPushing(true)` around the pull so the realtime echo guard doesn't bounce the rows back out. Returns `{ workspaceCount, tabCount }` for UI confirmation. Button lives at the bottom of the popup footer (`packages/browser-extension/src/popup/Popup.tsx`) — only visible when `user` is signed in. Click flow: `window.confirm` preamble explaining it's pull-only → spinner → success line (green) or error line (red) → 1.5s delay → `window.location.reload()` so `useTabFlow` re-fetches. No schema changes, no auto-pull, existing push-only model preserved. This handler is safe to leave in place as a general "disaster recovery" button for anyone whose local DB gets wiped. Followup: pin a static `key` in `manifest.chrome.json` so the unpacked extension ID stops depending on folder path — deliberately deferred so it doesn't orphan THIS install.
+- **2026-04-13** — SetupWizard test-connection endpoint and instructions fixed after a healthy project was still returning 401. The test was hitting `/rest/v1/` with `Authorization: Bearer <publishable_key>`, which PostgREST rejects for the new non-JWT `sb_publishable_…` keys. Switched the probe to `GET /auth/v1/settings` with only the `apikey` header — a GoTrue public endpoint that validates URL + key together without needing schema or a user JWT, and works equivalently for legacy `eyJ…` anon keys and new publishable keys. Also rewrote the "enter-credentials" step instructions to match the actual Supabase dashboard: Project URL is copied directly from the top of the project dashboard (not from Project Settings → API), and API Keys is reached via the "Get connected" row. Removed the misleading step that said the URL lives on the API Keys page.
+- **2026-04-13** — SetupWizard Supabase instructions rewritten in `packages/browser-extension/src/auth/SetupWizard.tsx` after a 401 failure with ambiguous guidance. `handleTestConnection` now branches on HTTP status (401 / 403 / 404 / 5xx / network) with actionable causes — e.g. 401 suggests a truncated key, the wrong key, or a paused project. The "enter-credentials" step was rebuilt with a numbered `<ol>` walkthrough (open supabase.com/dashboard → Project Settings → API → copy Project URL → copy publishable/anon key), explicit handling of BOTH key formats (legacy JWT `eyJ…` and the new `sb_publishable_…`), a red-text warning not to paste `service_role` / `sb_secret_…`, a direct link to the dashboard, and a placeholder string that shows both formats. Added matching styles (`steps`, `step`, `subSteps`, `code`, `link`) and bumped `errorBox` `lineHeight` to 1.55 for readability. Fixed a duplicate `link:` key in the styles object that was blocking the build. Chrome and Firefox dists rebuilt clean.
+- **2026-04-13** — Firefox support (cross-browser build). Renamed `packages/chrome-extension` → `packages/browser-extension` and `@tabflow/chrome-extension` → `@tabflow/browser-extension`. Split the single `public/manifest.json` into `manifest.chrome.json` and `manifest.firefox.json` templates; the Firefox variant adds `browser_specific_settings.gecko` (placeholder id `tabflow@samhamilton.dev`, min FF 128), drops Chrome-only permissions (`sidePanel`, `system.memory`), and swaps `side_panel` for `sidebar_action`. `vite.config.ts` reworked to read `TARGET=chrome|firefox` and emit to `dist/<target>/`, copying the right manifest in and scrubbing the stray template from the output. Added `packages/browser-extension/src/browser-compat.ts` exposing `BROWSER` / `isChrome` / `isFirefox` (via Vite's `define` → `import.meta.env.TARGET_BROWSER`) plus a `browserCompat.openSidebar()` wrapper around `chrome.sidePanel.open` / `browser.sidebarAction.open`. Added `cross-env` dep so `TARGET=...` env works on Windows. Root `package.json` scripts: `build`, `build:chrome`, `build:firefox`, `dev:chrome`; inner scripts mirror them via `cross-env`. Native-host: added `packages/native-host/install-firefox.bat` that writes to `HKCU\Software\Mozilla\NativeMessagingHosts` and uses `allowed_extensions` with the gecko id. Both Chrome and Firefox builds verified producing clean `dist/chrome/` and `dist/firefox/` with the correct manifest in each.
+- **2026-04-13** — Drop-indicator thinned in `packages/chrome-extension/src/newtab/NewTab.tsx`. Reduced the bar height from 3px to 1.5px, scaled the glow offsets down proportionally (3/8/16/32/56px instead of 4/10/20/40/70px), and adjusted the above/below anchor offsets from `-3px` to `-2px` to keep the bar visually centered in the gap between items.
+- **2026-04-13** — Drop-indicator glow styling in `packages/chrome-extension/src/newtab/NewTab.tsx`. Replaced the flat blue bar (`#6c8cff` with a single soft boxShadow) with a multi-layer backlit glow that matches the tab-tile pressed `glowStyle` aesthetic (see TabTile component, ~line 1961). The bar now uses the dragged workspace's own color as `dragIndicatorColor` (threaded from the parent as a new `WorkspaceSidebarItem` prop, falls back to `#6c8cff` if no workspace is being dragged) with five layered box-shadows from a bright 4px core out to a 70px soft halo, and pill-shaped rounded ends (`borderRadius: 999px`). Feels like a lit LED in the workspace's accent color.
+- **2026-04-13** — Drop-indicator flicker fix in `packages/chrome-extension/src/newtab/NewTab.tsx`. After the earlier drag-and-drop overhaul, the indicator bar was flickering between the hovered workspace and the bottom of the list as the cursor crossed the 4px flex gap between items. Cause: the container's `onDragOver` with `e.target !== e.currentTarget` guard still fired when the cursor was momentarily in a gap (there's no child element at that pixel, so `e.target === e.currentTarget`), setting the state to `'__bottom__'`. If the user released during that instant, the drop landed at the end. Fix: removed the container-level `onDragOver` / `onDrop` handlers and the `'__bottom__'` indicator div entirely. The per-item above/below logic already covers "drop at end" — hovering the bottom half of the last workspace correctly inserts below it. Also removed the now-stale `'__bottom__'` comment on the `dragOverPosition` state declaration.
+- **2026-04-13** — Workspace reorder drag-and-drop UX overhaul in `packages/chrome-extension/src/newtab/NewTab.tsx`. Root-cause bug: the `styles.workspacesList` container's `onDragOver`/`onDrop` bubbled from child workspace events and overwrote the target to `'__bottom__'`, causing every drop to land at the end. Fixed with `e.stopPropagation()` in child handlers and an `e.target !== e.currentTarget` guard on the container handlers. Added cursor-Y-based above/below drop-position detection (new `dragOverPosition` state), replaced the old 2px top border with a prominent 3px glowing blue indicator bar that renders above OR below the target based on cursor position, added a matching bar for drop-at-end, dimmed the item being dragged to opacity 0.35, and fixed `handleDrop` to insert at the indicated position with proper index adjustment after the dragged item is removed from the order array. `WorkspaceSidebarItem` props extended with `dragOverPosition` and `isBeingDragged`; `onDrop` signature changed to accept the drag event so it can call `stopPropagation`.
 - **2026-04-13** — Workspace archive (recycle bin) added. Deleted workspaces now restore-able. v4 Dexie schema. Version bumped to 0.1.1. `tabGroups` permission removed per Chrome Web Store rejection feedback. Initial Chrome Web Store submission rejected (tabGroups); resubmission pending.
 - **2026-04-12** — Multi-device "Resume Working Here" sync model implemented (migration 004, heartbeat, active-device gate). SetupWizard rewritten with skip/existing/new paths. Extension first submitted to Chrome Web Store (unlisted) with icon, screenshots, and listing copy.
 - **2026-04-11** — Initial feature set: workspaces, tabs, drag-drop, thumbnails, history (per-workspace snapshots), encrypted Supabase sync, native-host companion. Extension loaded unpacked for dev.

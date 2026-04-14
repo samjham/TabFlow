@@ -11,8 +11,10 @@
 CREATE TABLE IF NOT EXISTS public.user_settings (
   user_id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   encryption_salt text NOT NULL,
+  canary text,                        -- encrypted known plaintext for passphrase verification
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE public.user_settings ADD COLUMN IF NOT EXISTS canary text;
 
 CREATE TABLE IF NOT EXISTS public.workspaces (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

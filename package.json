@@ -9,13 +9,14 @@
   "scripts": {
     "build": "npm run build --workspaces",
     "build:core": "npm run build -w packages/core",
-    "build:chrome": "npm run build -w packages/chrome-extension",
-    "dev:chrome": "npm run dev -w packages/chrome-extension",
+    "build:chrome": "npm run build:chrome -w packages/browser-extension",
+    "build:firefox": "npm run build:firefox -w packages/browser-extension",
+    "dev:chrome": "npm run dev -w packages/browser-extension",
     "clean": "rm -rf packages/*/dist",
     "lint": "eslint packages/*/src --ext .ts,.tsx",
-    "typecheck": "tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/chrome-extension/tsconfig.json",
-    "test": "npm run test -w packages/core && npm run test -w packages/chrome-extension",
-    "test:smoke": "npm run test:smoke -w packages/chrome-extension"
+    "typecheck": "tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/browser-extension/tsconfig.json",
+    "test": "npm run test -w packages/core && npm run test -w packages/browser-extension",
+    "test:smoke": "npm run test:smoke -w packages/browser-extension"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",

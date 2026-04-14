@@ -1,9 +1,0 @@
-{ 
-  "name": "com.tabflow.memory", 
-  "description": "TabFlow memory monitor", 
-  "path": "C:\\Users\\shamilton\\OneDrive - vortexgov\\Documents\\Claude\\Browser Tab Manager Project\\packages\\chrome-extension\\native-host\\tabflow-memory-host.bat", 
-  "type": "stdio", 
-  "allowed_origins": [ 
-    "chrome-extension://ajmafblalbekdendgjfhdkppbnnoebok/" 
-  ] 
-} 
