@@ -4,13 +4,6 @@
  * Extracted from NewTab.tsx on 2026-04-15. This file is pure data —
  * a map of named CSSProperties objects consumed by NewTab.tsx,
  * WorkspaceSidebarItem.tsx, and TabCard.tsx.
- *
- * NOTE: A few entries below use `paddingX` / `paddingY` / `marginX` /
- * `marginY`, which are NOT valid CSSProperties fields and are silently
- * dropped by React at runtime. They're pre-existing (from before this
- * split) and are preserved verbatim to avoid behavior changes; a
- * dedicated pass should replace them with `paddingLeft` + `paddingRight`
- * (etc.) later.
  */
 
 import React from 'react';
@@ -109,11 +102,10 @@ export const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     flexDirection: 'column',
     gap: '4px',
-    paddingX: '8px',
-    paddingY: 0,
+    padding: '0 8px',
     flex: 1,
     minHeight: 0,
-  } as React.CSSProperties,
+  },
 
   sidebarWorkspaceItem: {
     padding: '8px 12px',
@@ -335,14 +327,13 @@ export const styles: Record<string, React.CSSProperties> = {
 
   newWorkspaceForm: {
     padding: '12px',
-    marginX: '8px',
-    marginY: '8px',
+    margin: '8px',
     backgroundColor: '#24272f',
     borderRadius: '8px',
     display: 'flex',
     flexDirection: 'column',
     gap: '8px',
-  } as React.CSSProperties,
+  },
 
   input: {
     width: '100%',
