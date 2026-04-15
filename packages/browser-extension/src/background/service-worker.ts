@@ -1404,6 +1404,28 @@ chrome.runtime.onMessage.addListener(
         }
 
         // ─── DEVICE SESSION MANAGEMENT ─────────────────────────────
+        //
+        // CLAIM_ACTIVE_DEVICE does a full materialization-verified claim:
+        //
+        //   1. pullAll from Supabase into IndexedDB (additive upsert).
+        //   2. Optionally save the current browser window's tabs to a new
+        //      "Recovered from {Browser}" workspace (mode: 'save-first').
+        //   3. Hold isSwitchingWorkspaces = true during the reshuffle so
+        //      snapshots can't fire.
+        //   4. Close all main-window tabs except the pinned TabFlow newtab.
+        //   5. Open the active workspace's tabs in sort_order.
+        //   6. Wait a settle window.
+        //   7. Re-snapshot the active workspace so IndexedDB matches window.
+        //   8. Verify: canonicalized URL set from window == IndexedDB tabs
+        //      for the active workspace. If diverged, fall back to option C:
+        //      auto-save the current browser tabs to a Recovered workspace
+        //      so nothing is truly lost, THEN abort the claim.
+        //   9. claimActiveDevice() + start heartbeat.
+        //  10. markSafeToPush so explicit actions begin syncing.
+        //
+        // Only after step 10 is the safeToPush gate open. Steps 1-9 run
+        // under isSwitchingWorkspaces = true so snapshots and their push
+        // path are doubly gated.
         if (message.type === 'CLAIM_ACTIVE_DEVICE') {
           try {
             if (!syncClient || !syncUserId) {
@@ -1411,52 +1433,39 @@ chrome.runtime.onMessage.addListener(
               return;
             }
 
-            // Phase 4 (2026-04-15): claim now pulls first, then claims.
-            //
-            // This is additive (upsert) — pullAll calls saveWorkspace/saveTab,
-            // which upsert by id. Local rows that aren't in the cloud are
-            // preserved, so a mid-pull failure still leaves the user with
-            // their previous state plus whatever pulled successfully.
-            //
-            // Safe because tab IDs are deterministic `tab-<16hex>` hashes
-            // now — the Chrome/Firefox ID collision that corrupted the cloud
-            // on April 15 can't recur. If an incoming cloud row describes
-            // the same (workspace, canonicalUrl) as a local row, they resolve
-            // to the same id and upsert merges cleanly.
-            //
-            // setPushing(true/false) suppresses the realtime echo guard so
-            // the pulled rows go straight into storage.
-            try {
-              syncClient.setPushing(true);
-              await syncClient.pullAll(syncUserId);
-            } catch (pullErr) {
-              // Surface decryption failures specially — almost always a
-              // passphrase mismatch on this install.
-              if (pullErr instanceof DOMException || (pullErr as any)?.name === 'OperationError') {
-                syncClient.setPushing(false);
-                sendResponse({
-                  success: false,
-                  error:
-                    'Decryption failed during pull. The passphrase on this install ' +
-                    'does not match the cloud data. Sign out and sign in again with ' +
-                    'the original passphrase.',
-                });
-                return;
-              }
-              // Non-crypto pull errors are logged but do NOT block the claim —
-              // the user still gets to take over; they can retry the pull by
-              // refreshing.
-              console.warn('[TabFlow] Pull-on-claim failed (continuing with claim):', pullErr);
-            } finally {
-              syncClient.setPushing(false);
-            }
+            const mode: 'close' | 'save-first' =
+              (message.payload?.mode === 'save-first') ? 'save-first' : 'close';
 
-            await syncClient.claimActiveDevice();
-            broadcastSyncUpdate();
-            sendResponse({ success: true });
+            const result = await claimActiveDeviceWithMaterialization(mode);
+            if (result.success) {
+              broadcastSyncUpdate();
+            }
+            sendResponse(result);
           } catch (err) {
             console.error('[TabFlow] Failed to claim active device:', err);
             sendResponse({ success: false, error: 'Failed to claim active device' });
+          }
+          return;
+        }
+
+        // Used by the pre-claim modal to show the user how many tabs are
+        // about to be overwritten and give them the save-first option.
+        if (message.type === 'GET_MAIN_WINDOW_TABS_SUMMARY') {
+          try {
+            const mainWindowId = cachedMainWindowId ?? await tabManager.getMainWindowId();
+            if (mainWindowId === undefined) {
+              sendResponse({ success: true, data: { count: 0, urls: [] } });
+              return;
+            }
+            const all = await chrome.tabs.query({ windowId: mainWindowId });
+            const keep = all.filter((t) => !tabManager.isTabFlowTab(t));
+            const urls = keep
+              .map((t) => t.url || t.pendingUrl || '')
+              .filter((u): u is string => Boolean(u));
+            sendResponse({ success: true, data: { count: keep.length, urls } });
+          } catch (err) {
+            console.error('[TabFlow] Failed to summarize main-window tabs:', err);
+            sendResponse({ success: false, error: 'Failed to summarize tabs' });
           }
           return;
         }
@@ -1498,6 +1507,8 @@ chrome.runtime.onMessage.addListener(
               const tabs = await storage.getTabs(ws.id);
               tabCount += tabs.length;
             }
+            // Explicit user-triggered pull — safe to push from here on.
+            await markSafeToPush('restore from cloud');
             broadcastSyncUpdate();
             sendResponse({
               success: true,
@@ -1618,6 +1629,232 @@ chrome.runtime.onMessage.addListener(
 );
 
 /**
+ * Claim active device with full materialization + verification.
+ *
+ * Returns { success: true } on success, or { success: false, error, recoveredWorkspaceId? }
+ * on failure. If the window couldn't be made to match the target workspace,
+ * `recoveredWorkspaceId` identifies the auto-save fallback workspace (option C)
+ * so the UI can mention it.
+ */
+async function claimActiveDeviceWithMaterialization(
+  mode: 'close' | 'save-first'
+): Promise<{ success: boolean; error?: string; recoveredWorkspaceId?: string }> {
+  if (!syncClient || !syncUserId) {
+    return { success: false, error: 'Sync not initialized' };
+  }
+
+  // ── Step 1: Pull from cloud (additive upsert) ───────────────────
+  try {
+    syncClient.setPushing(true);
+    await syncClient.pullAll(syncUserId);
+  } catch (pullErr) {
+    if (pullErr instanceof DOMException || (pullErr as any)?.name === 'OperationError') {
+      syncClient.setPushing(false);
+      return {
+        success: false,
+        error:
+          'Decryption failed during pull. The passphrase on this install does ' +
+          'not match the cloud data. Sign out and sign in again with the ' +
+          'original passphrase.',
+      };
+    }
+    // Non-crypto pull errors are logged and the claim aborts — we refuse to
+    // materialize against an incomplete cloud state.
+    syncClient.setPushing(false);
+    console.error('[TabFlow] Pull-on-claim failed, aborting claim:', pullErr);
+    return {
+      success: false,
+      error: 'Failed to pull from cloud. Check your network and try again.',
+    };
+  } finally {
+    syncClient.setPushing(false);
+  }
+
+  // Lock snapshots + explicit-action push paths while we reshuffle the window.
+  isSwitchingWorkspaces = true;
+
+  let recoveredWorkspaceId: string | undefined;
+
+  try {
+    // ── Step 2: Optional save-first ─────────────────────────────────
+    // Before we touch the user's current window, offer to save it so
+    // nothing is ever lost even if they changed their mind about claiming.
+    const mainWindowId = await tabManager.getMainWindowId();
+    if (mainWindowId === undefined) {
+      return { success: false, error: 'Main window not found' };
+    }
+
+    if (mode === 'save-first') {
+      try {
+        recoveredWorkspaceId = await saveMainWindowToRecoveredWorkspace(
+          mainWindowId,
+          'before claim'
+        );
+      } catch (saveErr) {
+        console.warn('[TabFlow] save-first failed (continuing):', saveErr);
+        // Don't abort — a failure to save-first shouldn't trap the user on
+        // the modal. They asked to claim and they get to claim; they just
+        // lose the save-first side effect.
+      }
+    }
+
+    // ── Step 3: Identify the active workspace from IndexedDB ────────
+    const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+    const activeWorkspace = workspaces.find((ws) => ws.isActive) || workspaces[0];
+    if (!activeWorkspace) {
+      return { success: false, error: 'No workspaces found after pull' };
+    }
+
+    // ── Step 4 & 5: Close current tabs, open the workspace's tabs ───
+    await tabManager.closeAllTabs();
+    const workspaceTabs = await storage.getTabs(activeWorkspace.id);
+    await tabManager.restoreWorkspaceTabs(workspaceTabs, storage, mainWindowId);
+
+    // ── Step 6: Settle window for tabs to at least commit ───────────
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    // ── Step 7: Re-snapshot so IndexedDB matches the window ────────
+    await tabManager.saveCurrentTabsToWorkspace(activeWorkspace.id, storage, mainWindowId);
+
+    // ── Step 8: Verify canonicalized URL sets match ────────────────
+    const verifyOk = await verifyWindowMatchesWorkspace(mainWindowId, activeWorkspace.id);
+    if (!verifyOk) {
+      // Option C: auto-save whatever the window actually has into a
+      // Recovered workspace so nothing is truly lost, then abort.
+      try {
+        const orphanWs = await saveMainWindowToRecoveredWorkspace(
+          mainWindowId,
+          'materialization verification failed'
+        );
+        recoveredWorkspaceId = recoveredWorkspaceId || orphanWs;
+      } catch (orphanErr) {
+        console.warn('[TabFlow] Option C orphan save failed:', orphanErr);
+      }
+      return {
+        success: false,
+        error:
+          "Couldn't make this browser's tabs match the active workspace. " +
+          (recoveredWorkspaceId
+            ? 'Your current tabs were saved to a recovered workspace so nothing is lost. '
+            : '') +
+          'Please try again, or sign out and back in.',
+        recoveredWorkspaceId,
+      };
+    }
+
+    // ── Step 9: Actually claim on Supabase ─────────────────────────
+    await syncClient.claimActiveDevice();
+
+    // ── Step 10: Open the push gate ────────────────────────────────
+    await markSafeToPush('claim with materialization completed');
+
+    return { success: true, recoveredWorkspaceId };
+  } finally {
+    isSwitchingWorkspaces = false;
+    refreshMainWindowId();
+  }
+}
+
+/**
+ * Saves the main window's current non-TabFlow tabs to a freshly created
+ * "Recovered from {browser} {timestamp}" workspace. Used by:
+ *   - User explicitly chose "save first" before claiming
+ *   - Option C fallback when materialization verification fails
+ *
+ * Returns the new workspace id, or throws if the save can't complete.
+ * The new workspace is NOT active (isActive: false) so we don't disturb
+ * the intended active workspace post-claim.
+ */
+async function saveMainWindowToRecoveredWorkspace(
+  mainWindowId: number,
+  context: string
+): Promise<string> {
+  const browserName = (import.meta as any).env?.TARGET_BROWSER === 'firefox' ? 'Firefox' : 'Chrome';
+  const now = new Date();
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  const timestamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  const name = `Recovered from ${browserName} ${timestamp}`;
+
+  // Create the workspace via storage directly so we don't flip any
+  // isActive flags (the engine's createWorkspace would set it active).
+  const id = crypto.randomUUID();
+  const existing = await storage.getWorkspaces(LOCAL_USER_ID);
+  const sortOrder = existing.length;
+  const workspace = {
+    id,
+    userId: LOCAL_USER_ID,
+    name,
+    color: '#8c8c8c',
+    icon: undefined as any,
+    shortName: undefined,
+    sortOrder,
+    isActive: false,
+    createdAt: now,
+    updatedAt: now,
+    version: 1,
+  };
+  await storage.saveWorkspace(workspace as any);
+
+  // Snapshot the current main-window tabs into it.
+  await tabManager.saveCurrentTabsToWorkspace(id, storage, mainWindowId);
+
+  console.log(`[TabFlow] Saved main-window tabs to recovered workspace "${name}" (${context})`);
+  return id;
+}
+
+/**
+ * Verifies that the main window's open tabs match the workspace's
+ * stored tabs by canonicalized URL. Multiset comparison: same URL can
+ * appear in both if the user has duplicates open. TabFlow's own newtab
+ * is excluded.
+ */
+async function verifyWindowMatchesWorkspace(
+  mainWindowId: number,
+  workspaceId: string
+): Promise<boolean> {
+  try {
+    const windowTabs = await chrome.tabs.query({ windowId: mainWindowId });
+    const storedTabs = await storage.getTabs(workspaceId);
+
+    const suspendedPrefix = `${chrome.runtime.getURL('')}suspended.html`;
+    const windowUrls: string[] = [];
+    for (const t of windowTabs) {
+      if (tabManager.isTabFlowTab(t)) continue;
+      let url = t.url || t.pendingUrl || '';
+      if (!url) continue;
+      if (url.startsWith(suspendedPrefix)) {
+        try { url = new URL(url).searchParams.get('url') || url; } catch { /* ignore */ }
+      }
+      windowUrls.push(canonicalizeUrl(url));
+    }
+
+    const storedUrls = storedTabs
+      .map((t) => canonicalizeUrl(t.url || ''))
+      .filter(Boolean);
+
+    if (windowUrls.length !== storedUrls.length) {
+      console.warn(
+        `[TabFlow] Verify: count mismatch window=${windowUrls.length} stored=${storedUrls.length}`
+      );
+      return false;
+    }
+
+    const windowSorted = [...windowUrls].sort();
+    const storedSorted = [...storedUrls].sort();
+    for (let i = 0; i < windowSorted.length; i++) {
+      if (windowSorted[i] !== storedSorted[i]) {
+        console.warn(`[TabFlow] Verify: url mismatch at ${i}: ${windowSorted[i]} vs ${storedSorted[i]}`);
+        return false;
+      }
+    }
+    return true;
+  } catch (err) {
+    console.error('[TabFlow] Verify failed:', err);
+    return false;
+  }
+}
+
+/**
  * After a successful local operation, push the change to Supabase.
  * Reads the current state from local storage and pushes it to Supabase
  * so that other devices receive the change via Realtime.
@@ -1628,6 +1865,16 @@ async function pushToSync(message: Message & { type: string }, responseData?: an
   // Only the active device may push changes to Supabase
   if (!syncClient.isActiveDevice) {
     console.log(`[TabFlow] Skipping sync push (not active device): ${message.type}`);
+    return;
+  }
+
+  // Second gate: only installs that have completed a materialization-verified
+  // claim (or have been locally verified as a pre-existing good install) may
+  // push. Protects against the class of bug where this browser's window tabs
+  // don't match the active workspace yet (e.g. first-run of a second browser
+  // that hasn't finished claiming). See safeToPush() for details.
+  if (!(await isSafeToPush())) {
+    console.log(`[TabFlow] Skipping sync push (safeToPush=false): ${message.type}`);
     return;
   }
 
@@ -1727,6 +1974,72 @@ async function pushToSync(message: Message & { type: string }, responseData?: an
     syncClient.setPushing(false);
   }
 }
+
+// ─── SAFE-TO-PUSH GATE ────────────────────────────────────────────
+//
+// A second gate (in addition to isActiveDevice) that governs whether this
+// install is allowed to push anything to Supabase. The gate stops a freshly
+// installed browser from pushing its accidental window tabs (the Firefox
+// claim incident on 2026-04-15).
+//
+// Set to TRUE when:
+//   - An existing install is detected on first run (workspaces already in
+//     local IndexedDB AND sync credentials stored — the user has been
+//     using this install safely already).
+//   - CLAIM_ACTIVE_DEVICE completes materialization + verification.
+//   - RESTORE_FROM_CLOUD completes (explicit user-triggered pull).
+//
+// Set to FALSE (or never set):
+//   - Fresh install with empty IndexedDB.
+//   - Installs that have never successfully claimed as active device.
+//
+// Stored in chrome.storage.local under 'tabflow_safe_to_push'.
+
+const SAFE_TO_PUSH_KEY = 'tabflow_safe_to_push';
+
+async function isSafeToPush(): Promise<boolean> {
+  try {
+    const result = await chrome.storage.local.get(SAFE_TO_PUSH_KEY);
+    return result?.[SAFE_TO_PUSH_KEY] === true;
+  } catch {
+    return false;
+  }
+}
+
+async function markSafeToPush(reason: string): Promise<void> {
+  try {
+    await chrome.storage.local.set({ [SAFE_TO_PUSH_KEY]: true });
+    console.log(`[TabFlow] safeToPush = true (${reason})`);
+  } catch (err) {
+    console.warn('[TabFlow] Failed to persist safeToPush flag:', err);
+  }
+}
+
+/**
+ * One-shot migration for existing installs. If this install already has
+ * workspaces in local IndexedDB, assume it's a pre-existing good install
+ * and mark safeToPush = true. This ensures users who've been running
+ * TabFlow happily for weeks don't suddenly stop syncing when they update
+ * to this version.
+ *
+ * Fresh installs (empty IndexedDB) leave the flag unset — they can only
+ * push after a successful claim.
+ */
+async function maybeMigrateSafeToPush(): Promise<void> {
+  try {
+    const existing = await chrome.storage.local.get(SAFE_TO_PUSH_KEY);
+    if (existing?.[SAFE_TO_PUSH_KEY] === true) return;
+    const workspaces = await storage.getWorkspaces(LOCAL_USER_ID);
+    if (workspaces.length > 0) {
+      await markSafeToPush('migrated — existing install with local workspaces');
+    }
+  } catch (err) {
+    console.warn('[TabFlow] safeToPush migration skipped:', err);
+  }
+}
+
+// Run the migration once, shortly after startup (after IndexedDB is ready).
+setTimeout(() => { maybeMigrateSafeToPush(); }, 1500);
 
 // ─── SYNC FILTERING HELPERS ───────────────────────────────────────
 
@@ -1955,38 +2268,25 @@ async function snapshotActiveWorkspace(): Promise<void> {
 
       console.log(`[TabFlow] Snapshot saved for workspace "${activeWorkspace.name}"`);
 
-      // Push the snapshot to Supabase so other devices see the change.
-      // Safe to re-enable (Phase 4, 2026-04-15) because tab IDs are now
-      // deterministic `tab-<16hex>` hashes of (workspaceId, canonicalUrl,
-      // firstSeenAt) — the Chrome/Firefox collision that caused the April 15
-      // data incident can't happen with content-derived IDs.
+      // Snapshots are intentionally NOT pushed to Supabase.
       //
-      // Guard rails still in place:
-      //   - Only the active device pushes (isActiveDevice check).
-      //   - setPushing(true/false) suppresses the realtime echo guard so our
-      //     own push doesn't bounce back and thrash the UI.
-      //   - isSyncableTab/isSyncableFavicon filter out chrome://, about:, and
-      //     extension-internal URLs that would be broken on other browsers.
-      if (syncClient && syncUserId && syncClient.isActiveDevice) {
-        try {
-          syncClient.setPushing(true);
-          await syncClient.pushWorkspace({ ...activeWorkspace, userId: syncUserId });
-          const tabsToPush = await storage.getTabs(activeWorkspace.id);
-          for (const tab of tabsToPush) {
-            if (!isSyncableTab(tab)) continue;
-            const sanitized = {
-              ...tab,
-              faviconUrl: isSyncableFavicon(tab.faviconUrl) ? tab.faviconUrl : undefined,
-            };
-            await syncClient.pushTab(sanitized);
-          }
-          console.log(`[TabFlow] Snapshot pushed to Supabase (${tabsToPush.length} tabs)`);
-        } catch (pushErr) {
-          console.error('[TabFlow] Snapshot push to Supabase failed:', pushErr);
-        } finally {
-          syncClient.setPushing(false);
-        }
-      }
+      // A snapshot scans the browser window's actual open tabs and writes
+      // them into the active workspace. That's only correct when the
+      // browser window IS the active workspace (the normal case on a
+      // single device the user has been actively using).
+      //
+      // Cross-browser sync broke this assumption: on a second browser that
+      // just pulled workspaces from the cloud, the browser window's real
+      // tabs (about:debugging, random pages, etc.) have no relationship to
+      // the pulled active workspace. A snapshot that fires in that state
+      // would overwrite the workspace with garbage and push it to the
+      // cloud, which on 2026-04-15 corrupted Chrome via realtime echo.
+      //
+      // Explicit user-intent actions (create / rename / delete / color /
+      // switch / move tabs) still push — those go through pushToSync.
+      // Claiming as active device triggers a full materialization flow
+      // that closes wrong tabs and opens the workspace's real tabs before
+      // any push can happen (see CLAIM_ACTIVE_DEVICE handler).
     } catch (error) {
       console.error('[TabFlow] Error in snapshot save:', error);
     } finally {

@@ -81,6 +81,13 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
   // ─── Multi-device sync: "Resume Working Here" ───
   const [isActiveDevice, setIsActiveDevice] = useState(true);
   const [inactiveClaimedBy, setInactiveClaimedBy] = useState<string | null>(null);
+  // Summary of the current browser window's tabs, shown in the claim modal
+  // so the user can see how many tabs are about to be replaced.
+  const [claimTabCount, setClaimTabCount] = useState<number>(0);
+  // User's chosen mode for what to do with those tabs before claiming.
+  const [claimMode, setClaimMode] = useState<'close' | 'save-first'>('save-first');
+  const [claimInProgress, setClaimInProgress] = useState(false);
+  const [claimError, setClaimError] = useState<string | null>(null);
 
   // ─── Passphrase mismatch safeguard ───
   // Set when the background service worker detected that the local passphrase
@@ -201,13 +208,36 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
 
   /** Handler for "Resume Working Here" button */
   const handleResumeHere = useCallback(() => {
-    chrome.runtime.sendMessage({ type: 'CLAIM_ACTIVE_DEVICE' }, (response) => {
+    setClaimInProgress(true);
+    setClaimError(null);
+    chrome.runtime.sendMessage(
+      { type: 'CLAIM_ACTIVE_DEVICE', payload: { mode: claimMode } },
+      (response) => {
+        setClaimInProgress(false);
+        if (response?.success) {
+          setIsActiveDevice(true);
+          setInactiveClaimedBy(null);
+          setClaimError(null);
+          // If the background created a Recovered workspace (either because
+          // the user chose save-first, or because Option C fired), the
+          // useWorkspaces hook will pick it up via the sync-update broadcast.
+        } else {
+          setClaimError(response?.error || 'Failed to resume here. Please try again.');
+        }
+      }
+    );
+  }, [claimMode]);
+
+  // When the modal appears, fetch a summary of the current window's tabs
+  // so we can show "14 tabs in this browser will be replaced".
+  useEffect(() => {
+    if (isActiveDevice) return;
+    chrome.runtime.sendMessage({ type: 'GET_MAIN_WINDOW_TABS_SUMMARY' }, (response) => {
       if (response?.success) {
-        setIsActiveDevice(true);
-        setInactiveClaimedBy(null);
+        setClaimTabCount(response.data?.count ?? 0);
       }
     });
-  }, []);
+  }, [isActiveDevice]);
 
   // Keep localTabs in sync with tabs from the hook (source of truth),
   // but only when we're NOT mid-drag.
@@ -1014,28 +1044,82 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
           </div>
         )}
 
-        {/* Resume Working Here banner (inactive device) */}
+        {/* Resume Working Here modal (inactive device) — blocks interaction
+            with the rest of the page until the user claims or closes the tab.
+            Using a full-viewport overlay rather than a banner because the
+            cross-browser-sync claim is destructive (replaces this browser's
+            tabs with the active workspace's tabs) and the user needs to
+            make an informed choice about what to do with the current tabs. */}
         {!isActiveDevice && (
-          <div style={styles.resumeBanner}>
-            <div style={styles.resumeBannerContent}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0 }}>
-                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" fill="#3b82f6"/>
-              </svg>
-              <span style={styles.resumeBannerText}>
-                Another device{inactiveClaimedBy ? ` (${inactiveClaimedBy})` : ''} is currently active. Changes you make here won't sync until you resume.
-              </span>
-              <button
-                style={styles.resumeButton}
-                onClick={handleResumeHere}
-                onMouseEnter={(e) => {
-                  (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#2563eb';
-                }}
-                onMouseLeave={(e) => {
-                  (e.currentTarget as HTMLButtonElement).style.backgroundColor = '#3b82f6';
-                }}
-              >
-                Resume Working Here
-              </button>
+          <div style={styles.resumeModalBackdrop}>
+            <div style={styles.resumeModal}>
+              <div style={styles.resumeModalAccent} />
+              <h2 style={styles.resumeModalTitle}>Another device is using TabFlow</h2>
+              <p style={styles.resumeModalSubtitle}>
+                {inactiveClaimedBy
+                  ? `Currently active on: ${inactiveClaimedBy}`
+                  : 'Another device is currently active.'}
+              </p>
+              <p style={styles.resumeModalBody}>
+                Taking over here will close this browser's {claimTabCount} tab
+                {claimTabCount === 1 ? '' : 's'} and open the tabs from your
+                active workspace instead.
+              </p>
+
+              <div style={styles.resumeModalChoices}>
+                <label style={styles.resumeModalChoice}>
+                  <input
+                    type="radio"
+                    name="claim-mode"
+                    value="save-first"
+                    checked={claimMode === 'save-first'}
+                    onChange={() => setClaimMode('save-first')}
+                    disabled={claimInProgress}
+                  />
+                  <div>
+                    <div style={styles.resumeModalChoiceLabel}>
+                      Save current tabs to a new workspace first
+                    </div>
+                    <div style={styles.resumeModalChoiceHint}>
+                      Recommended. Your current tabs will be saved to a
+                      "Recovered from…" workspace so nothing is lost.
+                    </div>
+                  </div>
+                </label>
+                <label style={styles.resumeModalChoice}>
+                  <input
+                    type="radio"
+                    name="claim-mode"
+                    value="close"
+                    checked={claimMode === 'close'}
+                    onChange={() => setClaimMode('close')}
+                    disabled={claimInProgress}
+                  />
+                  <div>
+                    <div style={styles.resumeModalChoiceLabel}>
+                      Close them (they're saved elsewhere)
+                    </div>
+                    <div style={styles.resumeModalChoiceHint}>
+                      Use this if these tabs are already captured on the
+                      other device.
+                    </div>
+                  </div>
+                </label>
+              </div>
+
+              {claimError && (
+                <div style={styles.resumeModalError}>{claimError}</div>
+              )}
+
+              <div style={styles.resumeModalActions}>
+                <button
+                  style={styles.resumeModalPrimary}
+                  onClick={handleResumeHere}
+                  disabled={claimInProgress}
+                >
+                  {claimInProgress ? 'Resuming…' : 'Resume Working Here'}
+                </button>
+              </div>
             </div>
           </div>
         )}

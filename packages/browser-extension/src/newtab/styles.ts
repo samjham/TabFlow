@@ -568,6 +568,125 @@ export const styles: Record<string, React.CSSProperties> = {
     transition: 'background-color 0.15s ease',
   } as React.CSSProperties,
 
+  // ─── Resume Working Here modal (replaces the old banner) ─────────
+  // Fixed full-viewport overlay that captures all clicks; the page
+  // behind it renders but is un-interactable because the backdrop
+  // sits on top.
+
+  resumeModalBackdrop: {
+    position: 'fixed',
+    inset: 0,
+    backgroundColor: 'rgba(5, 8, 16, 0.72)',
+    backdropFilter: 'blur(4px)',
+    WebkitBackdropFilter: 'blur(4px)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 9999,
+    padding: '24px',
+  } as React.CSSProperties,
+
+  resumeModal: {
+    backgroundColor: '#1f2230',
+    border: '1px solid #2d3142',
+    borderRadius: '12px',
+    maxWidth: '520px',
+    width: '100%',
+    padding: '28px 32px 24px',
+    boxShadow: '0 30px 80px 0 rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(108, 140, 255, 0.08)',
+    position: 'relative',
+    overflow: 'hidden',
+  } as React.CSSProperties,
+
+  resumeModalAccent: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    height: '3px',
+    background: 'linear-gradient(90deg, #3b82f6 0%, #6c8cff 50%, #3b82f6 100%)',
+  } as React.CSSProperties,
+
+  resumeModalTitle: {
+    fontSize: '20px',
+    fontWeight: 600,
+    color: '#f5f6fa',
+    margin: '0 0 8px 0',
+  } as React.CSSProperties,
+
+  resumeModalSubtitle: {
+    fontSize: '13px',
+    color: '#94a3b8',
+    margin: '0 0 16px 0',
+  } as React.CSSProperties,
+
+  resumeModalBody: {
+    fontSize: '14px',
+    lineHeight: 1.5,
+    color: '#cbd5e1',
+    margin: '0 0 18px 0',
+  } as React.CSSProperties,
+
+  resumeModalChoices: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '10px',
+    marginBottom: '18px',
+  } as React.CSSProperties,
+
+  resumeModalChoice: {
+    display: 'flex',
+    gap: '12px',
+    padding: '12px',
+    border: '1px solid #2d3142',
+    borderRadius: '8px',
+    cursor: 'pointer',
+    alignItems: 'flex-start',
+    backgroundColor: '#181b26',
+  } as React.CSSProperties,
+
+  resumeModalChoiceLabel: {
+    fontSize: '13px',
+    fontWeight: 600,
+    color: '#e2e8f0',
+    marginBottom: '4px',
+  } as React.CSSProperties,
+
+  resumeModalChoiceHint: {
+    fontSize: '12px',
+    color: '#94a3b8',
+    lineHeight: 1.45,
+  } as React.CSSProperties,
+
+  resumeModalError: {
+    padding: '10px 12px',
+    backgroundColor: 'rgba(220, 38, 38, 0.15)',
+    border: '1px solid rgba(220, 38, 38, 0.4)',
+    borderRadius: '6px',
+    color: '#fca5a5',
+    fontSize: '12.5px',
+    lineHeight: 1.45,
+    marginBottom: '14px',
+  } as React.CSSProperties,
+
+  resumeModalActions: {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    gap: '8px',
+  } as React.CSSProperties,
+
+  resumeModalPrimary: {
+    backgroundColor: '#3b82f6',
+    color: '#ffffff',
+    border: 'none',
+    borderRadius: '6px',
+    padding: '10px 20px',
+    fontSize: '13px',
+    fontWeight: 600,
+    cursor: 'pointer',
+    transition: 'background-color 0.15s ease',
+  } as React.CSSProperties,
+
   contentBody: {
     flex: 1,
     overflow: 'auto',
