@@ -296,11 +296,11 @@ async function initializeSync(userId: string) {
     // Store the real user ID for sync pushes
     syncUserId = userId;
 
-    // DISABLED: pullAll was downloading corrupted tab records from Supabase
-    // back into IndexedDB after local cleanup. Sync is push-only for now.
-    // TODO: Re-enable pull once Supabase data is clean, or add a
-    // "sync reset" button that wipes Supabase and re-uploads local state.
-    console.log('[TabFlow] Sync pull DISABLED — push-only mode');
+    // Startup pull is deliberately NOT run here. Pull now happens on demand:
+    //   - RESTORE_FROM_CLOUD (explicit user button)
+    //   - CLAIM_ACTIVE_DEVICE (when this device takes over as active)
+    // This avoids pulling every time the service worker wakes up.
+    console.log('[TabFlow] Sync initialized — pull on claim / restore only');
 
     console.log('[TabFlow] Sync initialized for user:', userId);
   } catch (error) {
@@ -1411,16 +1411,48 @@ chrome.runtime.onMessage.addListener(
               return;
             }
 
-            // Just claim — do NOT auto-pull or auto-clear local state.
-            // Cross-browser sync is disabled pending a proper redesign:
-            // tab IDs are currently browser-specific (e.g. chrome-1234 where
-            // 1234 is whatever internal ID the browser assigned), so Firefox's
-            // chrome-1234 and Chrome's chrome-1234 collide on the same Supabase
-            // row. A "pull" against a corrupted cloud can overwrite local data
-            // with another browser's tabs. Until IDs are deterministic across
-            // browsers (e.g. derived from workspace+URL), claiming is pure —
-            // user keeps whatever local state they have.
+            // Phase 4 (2026-04-15): claim now pulls first, then claims.
+            //
+            // This is additive (upsert) — pullAll calls saveWorkspace/saveTab,
+            // which upsert by id. Local rows that aren't in the cloud are
+            // preserved, so a mid-pull failure still leaves the user with
+            // their previous state plus whatever pulled successfully.
+            //
+            // Safe because tab IDs are deterministic `tab-<16hex>` hashes
+            // now — the Chrome/Firefox ID collision that corrupted the cloud
+            // on April 15 can't recur. If an incoming cloud row describes
+            // the same (workspace, canonicalUrl) as a local row, they resolve
+            // to the same id and upsert merges cleanly.
+            //
+            // setPushing(true/false) suppresses the realtime echo guard so
+            // the pulled rows go straight into storage.
+            try {
+              syncClient.setPushing(true);
+              await syncClient.pullAll(syncUserId);
+            } catch (pullErr) {
+              // Surface decryption failures specially — almost always a
+              // passphrase mismatch on this install.
+              if (pullErr instanceof DOMException || (pullErr as any)?.name === 'OperationError') {
+                syncClient.setPushing(false);
+                sendResponse({
+                  success: false,
+                  error:
+                    'Decryption failed during pull. The passphrase on this install ' +
+                    'does not match the cloud data. Sign out and sign in again with ' +
+                    'the original passphrase.',
+                });
+                return;
+              }
+              // Non-crypto pull errors are logged but do NOT block the claim —
+              // the user still gets to take over; they can retry the pull by
+              // refreshing.
+              console.warn('[TabFlow] Pull-on-claim failed (continuing with claim):', pullErr);
+            } finally {
+              syncClient.setPushing(false);
+            }
+
             await syncClient.claimActiveDevice();
+            broadcastSyncUpdate();
             sendResponse({ success: true });
           } catch (err) {
             console.error('[TabFlow] Failed to claim active device:', err);
@@ -1923,11 +1955,38 @@ async function snapshotActiveWorkspace(): Promise<void> {
 
       console.log(`[TabFlow] Snapshot saved for workspace "${activeWorkspace.name}"`);
 
-      // NOTE: Snapshot no longer pushes to Supabase. Cross-browser sync is
-      // temporarily disabled at the per-snapshot level — tab IDs are currently
-      // browser-specific and collide across browsers, which corrupts the cloud.
-      // Explicit actions (CREATE_WORKSPACE etc.) still push; day-to-day tab
-      // opens / closes are local-only until the ID scheme is redesigned.
+      // Push the snapshot to Supabase so other devices see the change.
+      // Safe to re-enable (Phase 4, 2026-04-15) because tab IDs are now
+      // deterministic `tab-<16hex>` hashes of (workspaceId, canonicalUrl,
+      // firstSeenAt) — the Chrome/Firefox collision that caused the April 15
+      // data incident can't happen with content-derived IDs.
+      //
+      // Guard rails still in place:
+      //   - Only the active device pushes (isActiveDevice check).
+      //   - setPushing(true/false) suppresses the realtime echo guard so our
+      //     own push doesn't bounce back and thrash the UI.
+      //   - isSyncableTab/isSyncableFavicon filter out chrome://, about:, and
+      //     extension-internal URLs that would be broken on other browsers.
+      if (syncClient && syncUserId && syncClient.isActiveDevice) {
+        try {
+          syncClient.setPushing(true);
+          await syncClient.pushWorkspace({ ...activeWorkspace, userId: syncUserId });
+          const tabsToPush = await storage.getTabs(activeWorkspace.id);
+          for (const tab of tabsToPush) {
+            if (!isSyncableTab(tab)) continue;
+            const sanitized = {
+              ...tab,
+              faviconUrl: isSyncableFavicon(tab.faviconUrl) ? tab.faviconUrl : undefined,
+            };
+            await syncClient.pushTab(sanitized);
+          }
+          console.log(`[TabFlow] Snapshot pushed to Supabase (${tabsToPush.length} tabs)`);
+        } catch (pushErr) {
+          console.error('[TabFlow] Snapshot push to Supabase failed:', pushErr);
+        } finally {
+          syncClient.setPushing(false);
+        }
+      }
     } catch (error) {
       console.error('[TabFlow] Error in snapshot save:', error);
     } finally {
