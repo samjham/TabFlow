@@ -1183,12 +1183,8 @@ async function handleMoveTabsInServiceWorker(payload: any): Promise<Response> {
   broadcastSyncUpdate();
 
   // Step 4: Close Chrome tabs asynchronously (fire-and-forget).
-  // Do this AFTER responding to the UI. Mark tabs so event handlers skip them.
+  // Do this AFTER responding to the UI.
   if (chromeIdsToClose.length > 0) {
-    for (const id of chromeIdsToClose) {
-      recentlyRemovedTabs.add(`chrome-${id}`);
-      setTimeout(() => recentlyRemovedTabs.delete(`chrome-${id}`), 10000);
-    }
     // Use setTimeout to truly decouple from the message response
     setTimeout(async () => {
       isSwitchingWorkspaces = true;
@@ -1498,7 +1494,7 @@ chrome.runtime.onMessage.addListener(
         }
 
         // Handle MOVE_TABS entirely in the service worker so we have direct
-        // control over recentlyRemovedTabs and isSwitchingWorkspaces.
+        // control over isSwitchingWorkspaces.
         if (message.type === 'MOVE_TABS') {
           const response = await handleMoveTabsInServiceWorker(message.payload);
           if (syncClient && response.success) {
@@ -1864,8 +1860,6 @@ async function captureActiveIfMissing(): Promise<void> {
  * what's currently in Chrome — it never creates phantom data.
  */
 
-const recentlyRemovedTabs = new Set<string>();
-
 /**
  * Debounced snapshot of the active workspace's tabs.
  * Multiple rapid events (e.g., closing several tabs) only trigger one save.
@@ -1960,10 +1954,6 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
   }
 
   if (!isInMainWindow(removeInfo.windowId)) return;
-
-  const tabKey = `chrome-${tabId}`;
-  recentlyRemovedTabs.add(tabKey);
-  setTimeout(() => recentlyRemovedTabs.delete(tabKey), 5000);
 
   // User closed a tab — snapshot to update the database
   snapshotActiveWorkspace();

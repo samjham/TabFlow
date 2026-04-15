@@ -494,7 +494,7 @@ export class MessageHandler {
 
     console.log(`[TabFlow] Moved ${movedCount} tabs to workspace ${targetWorkspaceId}`);
     // Return the Chrome tab IDs so the service worker can close them
-    // (it has direct access to recentlyRemovedTabs and isSwitchingWorkspaces)
+    // (it has direct access to isSwitchingWorkspaces)
     return { success: true, data: { movedCount, targetWorkspaceId, chromeTabIdsToClose } };
   }
 
