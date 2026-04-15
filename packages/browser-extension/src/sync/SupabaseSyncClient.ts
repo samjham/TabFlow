@@ -31,6 +31,36 @@ interface SupabaseSyncEvent {
 }
 
 /**
+ * Returns true if this URL is safe to sync / import across browsers.
+ *
+ * Rejects browser-internal URLs (`chrome://`, `about:`, `moz-extension://`,
+ * `chrome-extension://`, `edge://`, etc.) which are either unreachable on other
+ * browsers or point back at the extension's own pages. We only want real web
+ * pages (http/https) and local files to survive a round-trip through the cloud.
+ */
+function isSyncableTabUrl(url: string | undefined | null): boolean {
+  if (!url) return false;
+  if (url.startsWith('http://') || url.startsWith('https://')) return true;
+  if (url.startsWith('file://')) return true;
+  return false;
+}
+
+/**
+ * Returns true if this favicon URL is safe to display / sync.
+ *
+ * Firefox (and Chrome) sometimes surface browser-internal favicon URLs like
+ * `chrome://global/skin/icons/info.svg` which the OTHER browser can't load and
+ * will log as "Not allowed to load local resource". Only data-URIs and real
+ * http(s) URLs should cross the sync boundary.
+ */
+function isSyncableFaviconUrl(faviconUrl: string | undefined | null): boolean {
+  if (!faviconUrl) return false;
+  if (faviconUrl.startsWith('data:')) return true;
+  if (faviconUrl.startsWith('http://') || faviconUrl.startsWith('https://')) return true;
+  return false;
+}
+
+/**
  * Generates (or retrieves) a stable device ID for this Chrome installation.
  * Stored in chrome.storage.local so it persists across sessions but is
  * unique per browser profile.
@@ -467,6 +497,69 @@ export class SupabaseSyncClient {
   }
 
   /**
+   * Replaces the full set of tabs for a workspace in Supabase.
+   *
+   * This is the ONE correct way to sync per-workspace tab state, because
+   * local saves re-generate tab IDs on every workspace snapshot — if we only
+   * ever upsert new rows, Supabase accumulates zombies that each device
+   * re-pulls forever.
+   *
+   * Flow:
+   *   1. Query the current set of cloud tab IDs for this workspace
+   *   2. Upsert every local tab (filtered to syncable URLs / favicons)
+   *   3. Delete any cloud IDs that weren't in the pushed set
+   *
+   * The caller is responsible for wrapping this in setPushing(true/false).
+   */
+  async replaceWorkspaceTabs(workspaceId: string, tabs: Tab[]): Promise<{ pushed: number; deleted: number }> {
+    // 1. What's in the cloud right now for this workspace?
+    const { data: cloudRows, error: selectError } = await this.supabase
+      .from('tabs')
+      .select('id')
+      .eq('workspace_id', workspaceId);
+
+    if (selectError) {
+      throw new Error(`Failed to list cloud tabs for workspace: ${selectError.message}`);
+    }
+
+    const cloudIds = new Set<string>((cloudRows || []).map((r) => r.id));
+
+    // 2. Upsert each syncable tab. Track which IDs we kept.
+    const keptIds = new Set<string>();
+    let pushed = 0;
+    for (const tab of tabs) {
+      if (!isSyncableTabUrl(tab.url)) continue;
+      const toPush: Tab = isSyncableFaviconUrl(tab.faviconUrl)
+        ? tab
+        : { ...tab, faviconUrl: undefined };
+      await this.pushTab(toPush);
+      keptIds.add(tab.id);
+      pushed++;
+    }
+
+    // 3. Delete anything in the cloud that isn't in the new set.
+    const toDelete: string[] = [];
+    for (const id of cloudIds) {
+      if (!keptIds.has(id)) toDelete.push(id);
+    }
+
+    if (toDelete.length > 0) {
+      const { error: deleteError } = await this.supabase
+        .from('tabs')
+        .delete()
+        .in('id', toDelete);
+      if (deleteError) {
+        console.warn(
+          `[TabFlow] Failed to prune stale cloud tabs for workspace ${workspaceId}:`,
+          deleteError
+        );
+      }
+    }
+
+    return { pushed, deleted: toDelete.length };
+  }
+
+  /**
    * Deletes a workspace from Supabase.
    *
    * @param id - The workspace ID to delete
@@ -573,30 +666,65 @@ export class SupabaseSyncClient {
       }
     }
 
-    // Decrypt and save tabs
+    // Decrypt and save tabs — filtering out any tabs that represent
+    // browser-internal URLs. These sneak in when older builds (or the other
+    // browser) pushed their own extension pages / chrome:// URLs into the
+    // cloud. We drop them on import AND delete them from Supabase so they
+    // stop echoing back to every device.
     if (tabsData && tabsData.length > 0) {
-      const decryptedTabs = await Promise.all(
-        tabsData.map(async (tab) => {
+      const badIds: string[] = [];
+      const decryptedTabs: Tab[] = [];
+      for (const tab of tabsData) {
+        try {
           const decrypted = await decryptTab(
             { url: tab.url, title: tab.title },
             this.encryptionKey
           );
-          return {
+          if (!isSyncableTabUrl(decrypted.url)) {
+            console.log(
+              `[TabFlow] Dropping non-syncable tab from cloud: ${decrypted.url}`
+            );
+            badIds.push(tab.id);
+            continue;
+          }
+          decryptedTabs.push({
             id: tab.id,
             workspaceId: tab.workspace_id,
             url: decrypted.url,
             title: decrypted.title,
-            faviconUrl: tab.favicon_url,
+            faviconUrl: isSyncableFaviconUrl(tab.favicon_url)
+              ? tab.favicon_url
+              : undefined,
             sortOrder: tab.sort_order,
             isPinned: tab.is_pinned,
             lastAccessed: new Date(tab.last_accessed),
             updatedAt: new Date(tab.updated_at),
-          } as Tab;
-        })
-      );
+          });
+        } catch (err) {
+          console.warn('[TabFlow] Failed to decrypt tab on pull:', tab.id, err);
+        }
+      }
 
       for (const tabRecord of decryptedTabs) {
         await this.storage.saveTab(tabRecord);
+      }
+
+      // Clean up the bad rows in Supabase so they don't keep coming back.
+      if (badIds.length > 0) {
+        const { error: cleanupError } = await this.supabase
+          .from('tabs')
+          .delete()
+          .in('id', badIds);
+        if (cleanupError) {
+          console.warn(
+            '[TabFlow] Failed to clean up bad tabs in Supabase:',
+            cleanupError
+          );
+        } else {
+          console.log(
+            `[TabFlow] Cleaned up ${badIds.length} bad tab(s) from Supabase.`
+          );
+        }
       }
     }
   }
@@ -670,12 +798,24 @@ export class SupabaseSyncClient {
           this.encryptionKey
         );
 
+        // Drop browser-internal URLs at the realtime boundary too.
+        if (!isSyncableTabUrl(decrypted.url)) {
+          console.log(
+            `[TabFlow] Ignoring non-syncable realtime tab: ${decrypted.url}`
+          );
+          // Also clean it out of Supabase so it stops echoing.
+          await this.supabase.from('tabs').delete().eq('id', payload.new.id);
+          return;
+        }
+
         const tab: Tab = {
           id: payload.new.id,
           workspaceId: payload.new.workspace_id,
           url: decrypted.url,
           title: decrypted.title,
-          faviconUrl: payload.new.favicon_url,
+          faviconUrl: isSyncableFaviconUrl(payload.new.favicon_url)
+            ? payload.new.favicon_url
+            : undefined,
           sortOrder: payload.new.sort_order,
           isPinned: payload.new.is_pinned,
           lastAccessed: new Date(payload.new.last_accessed),

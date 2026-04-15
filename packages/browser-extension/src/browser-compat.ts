@@ -50,6 +50,24 @@ export function detectBrowser(): 'chrome' | 'firefox' | 'unknown' {
  *
  * This wrapper picks the right one based on what's available at runtime.
  */
+/**
+ * Returns the correct base URL prefix for this extension.
+ * Chrome: `chrome-extension://<id>/`
+ * Firefox: `moz-extension://<id>/`
+ *
+ * Use this instead of hardcoding `chrome-extension://`.
+ */
+export function getExtensionBaseUrl(): string {
+  return chrome.runtime.getURL('');
+}
+
+/**
+ * Returns the full URL for an extension page (e.g. 'newtab.html').
+ */
+export function getExtensionPageUrl(page: string): string {
+  return chrome.runtime.getURL(page);
+}
+
 export const browserCompat = {
   async openSidebar(tabId?: number): Promise<void> {
     const anyChrome = chrome as any;

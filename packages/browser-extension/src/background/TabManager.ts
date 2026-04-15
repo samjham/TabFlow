@@ -13,6 +13,7 @@
 
 import { Tab } from '@tabflow/core';
 import { NativeHostClient } from './NativeHostClient';
+import { getExtensionBaseUrl } from '../browser-compat';
 
 /** URLs that should never be saved as workspace tabs */
 const EXCLUDED_URL_PREFIXES = [
@@ -145,7 +146,7 @@ export class TabManager {
   isTrackableUrl(url: string): boolean {
     if (!url) return false;
     if (this.isSuspendedUrl(url)) return true;
-    if (url.startsWith(`chrome-extension://${chrome.runtime.id}/`)) return false;
+    if (url.startsWith(getExtensionBaseUrl())) return false;
     for (const prefix of EXCLUDED_URL_PREFIXES) {
       if (url.startsWith(prefix)) return false;
     }
@@ -154,7 +155,7 @@ export class TabManager {
 
   /** Checks if a URL is a TabFlow suspended tab */
   isSuspendedUrl(url: string): boolean {
-    return url.startsWith(`chrome-extension://${chrome.runtime.id}/suspended.html`);
+    return url.startsWith(`${getExtensionBaseUrl()}suspended.html`);
   }
 
   /** Extracts the real URL from a suspended tab URL */
@@ -315,12 +316,12 @@ export class TabManager {
 
     // Strategy 2: Check by extension URL
     if (url && !this.isSuspendedUrl(url)) {
-      if (url.startsWith(`chrome-extension://${chrome.runtime.id}/`)) return true;
+      if (url.startsWith(getExtensionBaseUrl())) return true;
     }
 
     // Strategy 3: Check by pendingUrl (during navigation)
     const pendingUrl = (tab as any).pendingUrl || '';
-    if (pendingUrl && pendingUrl.startsWith(`chrome-extension://${chrome.runtime.id}/`)) {
+    if (pendingUrl && pendingUrl.startsWith(getExtensionBaseUrl())) {
       return true;
     }
 
@@ -372,14 +373,13 @@ export class TabManager {
 
   /** Builds a suspended tab URL */
   private buildSuspendedUrl(tab: Tab): string {
-    const extensionId = chrome.runtime.id;
     const params = new URLSearchParams();
     params.set('url', tab.url);
     params.set('title', tab.title || 'Untitled');
     if (tab.faviconUrl) {
       params.set('favicon', tab.faviconUrl);
     }
-    return `chrome-extension://${extensionId}/suspended.html?${params.toString()}`;
+    return `${getExtensionBaseUrl()}suspended.html?${params.toString()}`;
   }
 
   /**
@@ -557,14 +557,14 @@ export class TabManager {
    */
   async getMainWindowId(): Promise<number | undefined> {
     try {
-      const extensionId = chrome.runtime.id;
-      const suspendedPrefix = `chrome-extension://${extensionId}/suspended.html`;
+      const extBase = getExtensionBaseUrl();
+      const suspendedPrefix = `${extBase}suspended.html`;
       const allTabs = await chrome.tabs.query({});
 
       // Strategy 1: Find by extension URL
       const tabFlowTab = allTabs.find(
         (t) =>
-          t.url?.startsWith(`chrome-extension://${extensionId}/`) &&
+          t.url?.startsWith(extBase) &&
           !t.url?.startsWith(suspendedPrefix)
       );
       if (tabFlowTab?.windowId !== undefined) {

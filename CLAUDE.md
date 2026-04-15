@@ -200,7 +200,77 @@ Native messaging (`packages/native-host/`) has separate installers because the r
 
 ---
 
-## 6. Build & Run
+## 6. New Machine Setup
+
+Follow these steps when setting up the project on a fresh computer (e.g. home PC).
+
+**Prerequisites — install these first if you don't have them:**
+
+1. **Git:** Download from https://git-scm.com/downloads — use default options during install. After install, open a terminal and run `git --version` to confirm.
+2. **Node.js (LTS):** Download from https://nodejs.org — pick the LTS version. After install, confirm with `node --version` and `npm --version`.
+3. **Configure your Git identity** (one-time, so commits have your name):
+   ```
+   git config --global user.name "Sam Hamilton"
+   git config --global user.email "shamilton@vortexgov.com"
+   ```
+
+**Clone and build:**
+
+1. Open a terminal and `cd` to wherever you want the project folder to live (e.g. `cd C:\Users\YourUser\Documents`).
+2. Clone the repo:
+   ```
+   git clone https://github.com/samjham/tabflow.git
+   ```
+3. Enter the folder and install dependencies:
+   ```
+   cd tabflow
+   npm install
+   ```
+4. Build the Chrome extension:
+   ```
+   npm run build:chrome
+   ```
+
+**Load the extension in Chrome:**
+
+1. Go to `chrome://extensions`
+2. Toggle **Developer mode** on (top right)
+3. Click **Load unpacked**
+4. Select the `packages/browser-extension/dist/chrome` folder inside the cloned repo
+
+**Set up native host (optional — needed for taskbar-hiding and memory stats):**
+
+1. Open a terminal in the project folder
+2. Run:
+   ```
+   cd packages/native-host
+   install-host.bat
+   ```
+3. Restart Chrome
+
+**Day-to-day workflow — pulling changes from your other machine:**
+
+Before starting work, pull the latest:
+```
+git pull origin main
+```
+
+After making changes, push them:
+```
+git add -A
+```
+```
+git commit -m "describe what you changed"
+```
+```
+git push origin main
+```
+
+Then on the other machine, `git pull origin main` to get those changes.
+
+---
+
+## 7. Build & Run
 
 ```bash
 # Install
@@ -248,7 +318,7 @@ cd packages/browser-extension/dist/firefox && zip -r ../../../../tabflow-firefox
 
 ---
 
-## 7. Publishing state
+## 8. Publishing state
 
 - **Chrome Web Store** submission: UNLISTED. First submission was rejected for requesting `tabGroups` permission without using it. Version 0.1.1 removed it.
 - **GitHub:** https://github.com/samjham/TabFlow (public, used for hosting the privacy policy via GitHub Pages)
@@ -259,30 +329,32 @@ When bumping the extension version in `manifest.json`, also bump in `package.jso
 
 ---
 
-## 8. Known issues / deferred items
+## 9. Known issues / deferred items
 
 - **Backlit glow on tab tiles** has a hard edge that Sam flagged. Deferred ("let's come back to that").
 - **Supabase pull** is disabled — push-only. Re-enabling requires design work to handle conflict resolution cleanly.
 - **Broad host permissions warning** from Chrome Web Store review: TabFlow uses `<all_urls>` because it genuinely needs to read every tab's URL to organize them. Listed as a warning, not a blocker, but reviews take longer.
+- **Cross-browser sync needs deterministic tab IDs (blocker for Firefox + Chrome coexistence).** Tab IDs are currently of the form `chrome-<numericId>` where the numeric ID comes from `chrome.tabs` — Chrome and Firefox each maintain independent internal counters starting from 1, so their IDs inevitably collide in Supabase on unrelated tabs (Firefox's `chrome-1234` = Gmail, Chrome's `chrome-1234` = GitHub, same Supabase row, last writer wins, `workspace_id` gets overwritten → tabs "teleport" between workspaces). On top of that, `saveCurrentTabsToWorkspace` (`packages/browser-extension/src/background/TabManager.ts`) regenerates tab IDs on every workspace snapshot, so the cloud accumulates zombies that a subsequent `pullAll` mass-imports as duplicates. Push-on-snapshot and clear-local-before-pull on Resume are BOTH currently disabled in `service-worker.ts` (see 2026-04-15 changelog) to prevent further corruption — Chrome is effectively local-only for day-to-day tab activity; only explicit actions (`CREATE_WORKSPACE`, rename, delete, etc.) still push. Proper fix requires IDs derived deterministically from `workspaceId + url + sortOrder` (or similar) so upserts intentionally collide across browsers, plus matching logic in `saveCurrentTabsToWorkspace` to reuse existing IDs by URL rather than minting new ones each snapshot.
 
 ---
 
-## 9. How to update this document
+## 10. How to update this document
 
 At the end of any meaningful work session (new feature, bug fix, publishing event), update:
 
 - **§ 5.** if you added a new subsystem
 - **§ 5.2** if you added a Dexie schema version
-- **§ 7.** if publishing state changed
-- **§ 8.** if you discovered a new known issue OR resolved a listed one
-- **§ 10.** changelog below — add a dated entry summarizing what changed
+- **§ 8.** if publishing state changed
+- **§ 9.** if you discovered a new known issue OR resolved a listed one
+- **§ 11.** changelog below — add a dated entry summarizing what changed
 
 Keep this document tight. It's for quickly onboarding a new Claude — not a full history. The **git log** is the full history. This file is the cliff notes.
 
 ---
 
-## 10. Changelog (most recent first)
+## 11. Changelog (most recent first)
 
+- **2026-04-15** — Cross-browser sync partially disabled after a full-day debugging session exposed a fundamental tab-ID collision bug between Chrome and Firefox. Timeline: (1) Added `chrome-extension://` → `getExtensionBaseUrl()` / `getExtensionPageUrl()` wrappers across `service-worker.ts`, `TabManager.ts`, `MessageHandler.ts` (new helpers in `browser-compat.ts`) so Firefox stops throwing "address wasn't understood" on `chrome-extension://tabflow@samhamilton.dev/newtab.html`. Also added `moz-extension://` to the `isCapturable` URL filter. Firefox manifest: changed `background.service_worker` → `background.scripts` since FF 149's MV3 rejects the service_worker key. These are all permanent and good. (2) Added aggressive sync behavior that turned out to be dangerous: `CLAIM_ACTIVE_DEVICE` was rewritten to clear all local tabs and then `pullAll()` from Supabase before claiming, and `snapshotActiveWorkspace` began pushing every tab change to Supabase. These were intended to make "Resume Working Here" pull-not-push and to make day-to-day edits sync across browsers. In practice both paths amplified a pre-existing ID collision: tab IDs are generated as `chrome-<numericId>` where `numericId` is the browser's internal `chrome.tabs` ID — Chrome and Firefox each start counting from 1, so unrelated tabs in each browser map to the same Supabase row. Upserts from Firefox overwrote `workspace_id` on rows Chrome had pushed, causing tabs to visibly teleport between workspaces. Compounding: `saveCurrentTabsToWorkspace` regenerates IDs on every snapshot, so the cloud accumulated hundreds of zombie rows (368 in Sam's case) that `pullAll` mass-imported as duplicates, and the realtime echo of all the churn caused UI thrash (multiple workspaces highlighted at once, state flicker). (3) Rollback (current state): `CLAIM_ACTIVE_DEVICE` is back to a pure `claimActiveDevice()` — no clear, no pull. `snapshotActiveWorkspace` no longer pushes to Supabase at all. Explicit actions (create/rename/delete workspace) still push as they always have. Kept as harmless defensive additions: URL / favicon filters in `SupabaseSyncClient.pullAll` and `handleTabChange` (drop `chrome://…`, `about:…`, `moz-extension://…` on inbound, drop non-`data:` / non-`http(s):` favicons like `chrome://global/skin/icons/info.svg`), and a `replaceWorkspaceTabs` method that's defined but currently unused (kept for the eventual redesign). Sam wiped Supabase `tabs` + `workspaces` tables and the local `TabFlowDB` IndexedDB, then rebuilt workspaces by hand. Firefox is not to be opened against this install until cross-browser sync is redesigned. See §9 for the real fix (deterministic IDs).
 - **2026-04-13** — Stale `tabFlowTabId` collision fix in `packages/browser-extension/src/background/service-worker.ts` (`ensureTabFlowTab`, Strategy 3). After a full Chrome restart, Chrome reassigns every tab a fresh numeric ID, so the `tabFlowTabId` persisted in `chrome.storage.local` from the previous session can now coincidentally point to a completely unrelated tab — notably `chrome://extensions`, which is commonly open during unpacked-install development when the extension reloads. The old Strategy 3 matched purely on ID and handed the tab straight to the pin/move logic, which would then pin `chrome://extensions` at index 0 and never route to the real TabFlow newtab. Strategies 1/2/4/5 didn't save us because on a cold service-worker wake-up the TabFlow tab often hasn't been re-created yet. Fix: Strategy 3 now validates the candidate tab's URL before trusting the stored ID — accepts only `chrome-extension://<extensionId>/…` (URL or `pendingUrl`), `chrome://newtab/` / `chrome://newtab`, empty string, or `about:blank`, and explicitly rejects `suspendedPrefix`. If the candidate doesn't match, the stale ID is removed from `chrome.storage.local` so subsequent runs don't keep hitting the same collision, and the function falls through to Strategies 4/5 which correctly locate (or create) the real keeper. No schema changes, no behavior change on the happy path.
 - **2026-04-13** — Data-loss safeguards added after the folder-rename incident permanently destroyed a user's local workspaces (new extension ID → empty IndexedDB; cloud rows present but undecryptable because the encryption salt was only ever stored in chrome.storage.local and had been GC'd by Chrome). Three defenses now ship together in version **0.1.2**:
   1. **Pinned extension ID.** `packages/browser-extension/public/manifest.chrome.json` now includes a `key` field (RSA 2048 public key, base64-encoded). The extension ID is now derived from this key, NOT the folder path, so future folder renames will reuse the same ID and the same IndexedDB. Private key was generated with `openssl genrsa 2048` and intentionally NOT committed — losing it only means a future keypair swap requires unpacked-install users to re-import, it doesn't affect cloud data.

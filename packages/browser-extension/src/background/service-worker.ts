@@ -15,6 +15,7 @@ import { TabManager } from './TabManager';
 import { WorkspaceEngine } from '@tabflow/core';
 import { deriveKey } from '@tabflow/core';
 import { encrypt, decrypt } from '@tabflow/core/crypto/encryption';
+import { getExtensionBaseUrl, getExtensionPageUrl } from '../browser-compat';
 
 /**
  * Known plaintext encrypted with the user's key and stored in user_settings.canary.
@@ -327,8 +328,8 @@ async function ensureTabFlowTab() {
   ensureTabFlowRunning = true;
 
   try {
-    const extensionId = chrome.runtime.id;
-    const suspendedPrefix = `chrome-extension://${extensionId}/suspended.html`;
+    const extBase = getExtensionBaseUrl(); // chrome-extension://<id>/ or moz-extension://<id>/
+    const suspendedPrefix = `${extBase}suspended.html`;
 
     // Search ALL windows for tabs
     const allTabs = await chrome.tabs.query({});
@@ -336,7 +337,7 @@ async function ensureTabFlowTab() {
 
     // Strategy 1: Find by extension URL (most reliable after page loads)
     let keeper = allTabs.find(
-      (t) => t.url?.startsWith(`chrome-extension://${extensionId}/`) &&
+      (t) => t.url?.startsWith(extBase) &&
              !t.url?.startsWith(suspendedPrefix)
     ) || null;
     if (keeper) console.log(`[TabFlow] Found TabFlow tab by extension URL (tab ${keeper.id})`);
@@ -344,7 +345,7 @@ async function ensureTabFlowTab() {
     // Strategy 2: Find by pendingUrl (during navigation)
     if (!keeper) {
       keeper = allTabs.find(
-        (t) => (t as any).pendingUrl?.startsWith(`chrome-extension://${extensionId}/`) &&
+        (t) => (t as any).pendingUrl?.startsWith(extBase) &&
                !(t as any).pendingUrl?.startsWith(suspendedPrefix)
       ) || null;
       if (keeper) console.log(`[TabFlow] Found TabFlow tab by pendingUrl (tab ${keeper.id})`);
@@ -364,8 +365,8 @@ async function ensureTabFlowTab() {
           const candidateUrl = candidate.url || '';
           const candidatePendingUrl = (candidate as any).pendingUrl || '';
           const looksLikeTabFlow =
-            candidateUrl.startsWith(`chrome-extension://${extensionId}/`) ||
-            candidatePendingUrl.startsWith(`chrome-extension://${extensionId}/`) ||
+            candidateUrl.startsWith(extBase) ||
+            candidatePendingUrl.startsWith(extBase) ||
             candidateUrl === 'chrome://newtab/' ||
             candidateUrl === 'chrome://newtab' ||
             candidateUrl === '' ||
@@ -407,7 +408,7 @@ async function ensureTabFlowTab() {
       const keeperUrl = keeper.url || '';
       if (keeperUrl === 'chrome://newtab/' || keeperUrl === 'chrome://newtab' || keeperUrl === '' || keeperUrl === 'about:blank') {
         try {
-          await chrome.tabs.update(keeper.id, { url: `chrome-extension://${extensionId}/newtab.html` });
+          await chrome.tabs.update(keeper.id, { url: getExtensionPageUrl('newtab.html') });
           console.log('[TabFlow] Navigated keeper tab to explicit extension URL');
         } catch (e) {
           console.warn('[TabFlow] Could not navigate keeper to extension URL:', e);
@@ -448,7 +449,7 @@ async function ensureTabFlowTab() {
 
       console.log(`[TabFlow] Creating TabFlow tab in window ${targetWindowId ?? 'default'}`);
       const created = await chrome.tabs.create({
-        url: `chrome-extension://${extensionId}/newtab.html`,
+        url: getExtensionPageUrl('newtab.html'),
         pinned: true,
         active: false,
         ...(targetWindowId !== undefined ? { windowId: targetWindowId } : {}),
@@ -466,7 +467,7 @@ async function ensureTabFlowTab() {
     const keeperId = keeper?.id ?? (await chrome.storage.local.get('tabFlowTabId')).tabFlowTabId;
     const duplicates = allTabs.filter(
       (t) => t.id !== keeperId &&
-             t.url?.startsWith(`chrome-extension://${extensionId}/`) &&
+             t.url?.startsWith(extBase) &&
              !t.url?.startsWith(suspendedPrefix)
     );
     for (const dupe of duplicates) {
@@ -1282,13 +1283,24 @@ chrome.runtime.onMessage.addListener(
         // ─── DEVICE SESSION MANAGEMENT ─────────────────────────────
         if (message.type === 'CLAIM_ACTIVE_DEVICE') {
           try {
-            if (syncClient) {
-              await syncClient.claimActiveDevice();
-              sendResponse({ success: true });
-            } else {
+            if (!syncClient || !syncUserId) {
               sendResponse({ success: false, error: 'Sync not initialized' });
+              return;
             }
+
+            // Just claim — do NOT auto-pull or auto-clear local state.
+            // Cross-browser sync is disabled pending a proper redesign:
+            // tab IDs are currently browser-specific (e.g. chrome-1234 where
+            // 1234 is whatever internal ID the browser assigned), so Firefox's
+            // chrome-1234 and Chrome's chrome-1234 collide on the same Supabase
+            // row. A "pull" against a corrupted cloud can overwrite local data
+            // with another browser's tabs. Until IDs are deterministic across
+            // browsers (e.g. derived from workspace+URL), claiming is pure —
+            // user keeps whatever local state they have.
+            await syncClient.claimActiveDevice();
+            sendResponse({ success: true });
           } catch (err) {
+            console.error('[TabFlow] Failed to claim active device:', err);
             sendResponse({ success: false, error: 'Failed to claim active device' });
           }
           return;
@@ -1561,6 +1573,36 @@ async function pushToSync(message: Message & { type: string }, responseData?: an
   }
 }
 
+// ─── SYNC FILTERING HELPERS ───────────────────────────────────────
+
+/**
+ * Determines whether a tab's URL is safe to push to cloud sync.
+ * Filters out browser-internal and extension-internal URLs that would
+ * be meaningless (or actively broken) on a different browser.
+ *
+ * Accepted: http, https, file
+ * Rejected: chrome://, moz-extension://, chrome-extension://, about:, etc.
+ */
+function isSyncableTab(tab: { url: string }): boolean {
+  const url = tab.url || '';
+  if (!url) return false;
+  if (url.startsWith('http://') || url.startsWith('https://')) return true;
+  if (url.startsWith('file://')) return true;
+  return false;
+}
+
+/**
+ * Determines whether a favicon URL is safe to push to cloud sync.
+ * Browser-internal favicon URLs (chrome://global/..., resource://...)
+ * render as broken images when loaded on a different browser.
+ */
+function isSyncableFavicon(faviconUrl?: string): boolean {
+  if (!faviconUrl) return false;
+  if (faviconUrl.startsWith('data:')) return true;
+  if (faviconUrl.startsWith('http://') || faviconUrl.startsWith('https://')) return true;
+  return false;
+}
+
 // ─── THUMBNAIL CAPTURE ────────────────────────────────────────────
 // Lazily captures screenshots of tabs as the user visits them.
 // Thumbnails are stored as small JPEG data URLs in IndexedDB.
@@ -1576,6 +1618,7 @@ function isCapturable(url: string): boolean {
   if (!url) return false;
   if (url.startsWith('chrome://') ||
       url.startsWith('chrome-extension://') ||
+      url.startsWith('moz-extension://') ||
       url.startsWith('about:') ||
       url.startsWith('edge://') ||
       url.startsWith('devtools://') ||
@@ -1758,6 +1801,12 @@ async function snapshotActiveWorkspace(): Promise<void> {
       }
 
       console.log(`[TabFlow] Snapshot saved for workspace "${activeWorkspace.name}"`);
+
+      // NOTE: Snapshot no longer pushes to Supabase. Cross-browser sync is
+      // temporarily disabled at the per-snapshot level — tab IDs are currently
+      // browser-specific and collide across browsers, which corrupts the cloud.
+      // Explicit actions (CREATE_WORKSPACE etc.) still push; day-to-day tab
+      // opens / closes are local-only until the ID scheme is redesigned.
     } catch (error) {
       console.error('[TabFlow] Error in snapshot save:', error);
     } finally {
@@ -1833,7 +1882,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     const tab = await chrome.tabs.get(activeInfo.tabId);
 
     // Auto-load suspended tabs
-    const suspendedPrefix = `chrome-extension://${chrome.runtime.id}/suspended.html`;
+    const suspendedPrefix = `${getExtensionBaseUrl()}suspended.html`;
     if (tab.url?.startsWith(suspendedPrefix)) {
       const params = new URL(tab.url).searchParams;
       const realUrl = params.get('url');

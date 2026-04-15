@@ -10,6 +10,7 @@
 import { WorkspaceEngine } from '@tabflow/core';
 import type { Workspace, Tab, StorageAdapter } from '@tabflow/core';
 import { TabManager } from './TabManager';
+import { getExtensionBaseUrl } from '../browser-compat';
 
 /** The local user ID (single-user for now, auth comes later) */
 const LOCAL_USER_ID = 'local-user';
@@ -980,7 +981,7 @@ export class MessageHandler {
       }
 
       // Helper: extract the real URL from a suspended tab URL
-      const suspendedPrefix = `chrome-extension://${chrome.runtime.id}/suspended.html`;
+      const suspendedPrefix = `${getExtensionBaseUrl()}suspended.html`;
       const getRealUrl = (tabUrl: string): string => {
         if (tabUrl.startsWith(suspendedPrefix)) {
           try {

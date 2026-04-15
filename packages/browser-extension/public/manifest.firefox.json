@@ -38,7 +38,7 @@
     "default_title": "TabFlow"
   },
   "background": {
-    "service_worker": "background.js",
+    "scripts": ["background.js"],
     "type": "module"
   },
   "chrome_url_overrides": {
