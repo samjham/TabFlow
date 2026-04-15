@@ -1648,7 +1648,16 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                       zIndex: 9999,
                       pointerEvents: 'none',
                       transform: 'scale(1.03)',
-                      boxShadow: '0 0 0 2px rgba(255, 200, 120, 0.45), 0 6px 20px rgba(255, 180, 80, 0.35), 0 4px 12px rgba(0, 0, 0, 0.4)',
+                      // Soft amber halo (no spread, all blur) to match TabCard's
+                      // pressed-state aesthetic. The previous first layer was
+                      // `0 0 0 2px ...` — a zero-blur ring that read as a hard
+                      // edge the instant a drag started.
+                      boxShadow: [
+                        '0 0 15px 0px rgba(255, 200, 120, 0.5)',
+                        '0 0 35px 0px rgba(255, 180, 80, 0.3)',
+                        '0 0 70px 0px rgba(255, 180, 80, 0.15)',
+                        '0 10px 30px 0px rgba(0, 0, 0, 0.4)',
+                      ].join(', '),
                       borderRadius: '8px',
                     }}
                   >
