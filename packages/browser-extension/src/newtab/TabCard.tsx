@@ -50,11 +50,20 @@ export const TabCard: React.FC<TabCardProps> = ({ tab, accentColor, selected, th
   // - No hover: no glow (tile flat, dark)
   // - Hover: tight glow leaking around edges (tile flush against background)
   // - Pressed: tile lifts off — glow spreads wide, dark shadow cast below, slight scale-up
+  //
+  // An `inset` glow is layered in both states to brighten the card's interior
+  // edge. Without it, the exterior halo meets a flat-dark interior at the card
+  // boundary and reads as a hard edge. The inset layer bridges that contrast
+  // step so the glow appears continuous from inside the tile to outside.
   const glowStyle: React.CSSProperties = pressed
     ? {
         border: '1px solid transparent',
         boxShadow: [
-          // All blur, no spread — pure soft glow like a backlit LED
+          // Inset glow — brightens the interior edge so the tile isn't
+          // a dark cut-out against the exterior halo
+          `inset 0 0 25px 0px ${accentColor}35`,
+          `inset 0 0 50px 0px ${accentColor}18`,
+          // Exterior halo — all blur, no spread, pure soft light
           `0 0 20px 0px ${accentColor}50`,
           `0 0 40px 0px ${accentColor}35`,
           `0 0 70px 0px ${accentColor}25`,
@@ -69,7 +78,12 @@ export const TabCard: React.FC<TabCardProps> = ({ tab, accentColor, selected, th
     : hover
     ? {
         border: '1px solid transparent',
-        boxShadow: `0 0 12px 0px ${accentColor}30, 0 0 25px 0px ${accentColor}15`,
+        boxShadow: [
+          // Subtle inset matched to the tighter exterior halo
+          `inset 0 0 15px 0px ${accentColor}20`,
+          `0 0 12px 0px ${accentColor}30`,
+          `0 0 25px 0px ${accentColor}15`,
+        ].join(', '),
       }
     : {};
 
