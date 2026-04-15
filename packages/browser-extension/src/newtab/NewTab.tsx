@@ -9,13 +9,15 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useWorkspaces, SearchResult } from './useWorkspaces';
-import type { WorkspaceHistoryEntry } from '@tabflow/core';
+import type { WorkspaceHistoryEntry, DeletedWorkspace } from '@tabflow/core';
 import * as AuthManager from '../auth/AuthManager';
 import type { Tab } from '@tabflow/core';
 import { SIDEBAR_WIDTH, COLOR_PALETTE, formatBytes } from './constants';
 import { styles } from './styles';
 import { WorkspaceSidebarItem } from './WorkspaceSidebarItem';
 import { TabCard } from './TabCard';
+import { HistoryPanel } from './HistoryPanel';
+import { ArchivePanel } from './ArchivePanel';
 
 interface NewTabProps {
   user?: { id: string; email: string } | null;
@@ -72,7 +74,7 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
 
   // ─── Deleted workspaces archive (recycle bin) ───
   const [showArchivePanel, setShowArchivePanel] = useState(false);
-  const [deletedWorkspaces, setDeletedWorkspaces] = useState<any[]>([]);
+  const [deletedWorkspaces, setDeletedWorkspaces] = useState<DeletedWorkspace[]>([]);
   const [selectedArchiveIds, setSelectedArchiveIds] = useState<Set<string>>(new Set());
   const [archiveLoading, setArchiveLoading] = useState(false);
 
@@ -750,20 +752,6 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
     }
   }, [activeWorkspace, historyEntries, historyIndex, restoreHistoryEntry]);
 
-  /** Human-friendly relative time label */
-  const formatTimeAgo = (date: Date): string => {
-    const now = Date.now();
-    const diffMs = now - date.getTime();
-    const diffMin = Math.floor(diffMs / 60000);
-    if (diffMin < 1) return 'just now';
-    if (diffMin < 60) return `${diffMin} minute${diffMin !== 1 ? 's' : ''} ago`;
-    const diffHrs = Math.floor(diffMin / 60);
-    if (diffHrs < 24) return `${diffHrs} hour${diffHrs !== 1 ? 's' : ''} ago`;
-    const diffDays = Math.floor(diffHrs / 24);
-    if (diffDays < 30) return `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`;
-    return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
-  };
-
   // Close history panel when switching workspaces
   useEffect(() => {
     setShowHistoryPanel(false);
@@ -980,103 +968,14 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
             </h2>
           </div>
           {showArchivePanel && (
-            <div style={{ padding: '0 12px 8px' }}>
-              {archiveLoading ? (
-                <div style={{ color: '#6b7084', fontSize: '12px', padding: '8px 0' }}>Loading...</div>
-              ) : deletedWorkspaces.length === 0 ? (
-                <div style={{ color: '#6b7084', fontSize: '12px', padding: '8px 0' }}>No deleted workspaces</div>
-              ) : (
-                <>
-                  <div style={{ maxHeight: '200px', overflowY: 'auto' as const, marginBottom: '8px' }}>
-                    {deletedWorkspaces.map((dw) => (
-                      <label
-                        key={dw.id}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '8px',
-                          padding: '6px 4px',
-                          borderRadius: '6px',
-                          cursor: 'pointer',
-                          fontSize: '13px',
-                          color: '#c9cdd8',
-                          backgroundColor: selectedArchiveIds.has(dw.id) ? 'rgba(108, 140, 255, 0.15)' : 'transparent',
-                        }}
-                        onMouseEnter={(e) => {
-                          if (!selectedArchiveIds.has(dw.id)) {
-                            (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255,255,255,0.05)';
-                          }
-                        }}
-                        onMouseLeave={(e) => {
-                          (e.currentTarget as HTMLElement).style.backgroundColor = selectedArchiveIds.has(dw.id) ? 'rgba(108, 140, 255, 0.15)' : 'transparent';
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selectedArchiveIds.has(dw.id)}
-                          onChange={() => handleToggleArchiveSelection(dw.id)}
-                          style={{ accentColor: '#6c8cff', flexShrink: 0 }}
-                        />
-                        <div
-                          style={{
-                            width: '10px',
-                            height: '10px',
-                            borderRadius: '50%',
-                            backgroundColor: dw.workspace?.color || '#6c8cff',
-                            flexShrink: 0,
-                          }}
-                        />
-                        <div style={{ overflow: 'hidden', flex: 1, minWidth: 0 }}>
-                          <div style={{ whiteSpace: 'nowrap' as const, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                            {dw.workspace?.name || 'Unnamed'}
-                          </div>
-                          <div style={{ fontSize: '11px', color: '#6b7084' }}>
-                            {dw.tabs?.length || 0} tab{(dw.tabs?.length || 0) !== 1 ? 's' : ''} · {new Date(dw.deletedAt).toLocaleDateString()}
-                          </div>
-                        </div>
-                      </label>
-                    ))}
-                  </div>
-                  {selectedArchiveIds.size > 0 && (
-                    <div style={{ display: 'flex', gap: '6px' }}>
-                      <button
-                        onClick={handleRestoreSelected}
-                        style={{
-                          flex: 1,
-                          padding: '6px 10px',
-                          borderRadius: '6px',
-                          border: 'none',
-                          background: '#6c8cff',
-                          color: '#fff',
-                          fontSize: '12px',
-                          fontWeight: 600,
-                          cursor: 'pointer',
-                        }}
-                        title="Restore selected workspaces"
-                      >
-                        Restore ({selectedArchiveIds.size})
-                      </button>
-                      <button
-                        onClick={handlePermanentlyDeleteSelected}
-                        style={{
-                          padding: '6px 10px',
-                          borderRadius: '6px',
-                          border: '1px solid rgba(255, 107, 157, 0.3)',
-                          background: 'transparent',
-                          color: '#ff6b9d',
-                          fontSize: '12px',
-                          fontWeight: 600,
-                          cursor: 'pointer',
-                        }}
-                        title="Permanently delete selected"
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
+            <ArchivePanel
+              loading={archiveLoading}
+              deletedWorkspaces={deletedWorkspaces}
+              selectedIds={selectedArchiveIds}
+              onToggleSelection={handleToggleArchiveSelection}
+              onRestore={handleRestoreSelected}
+              onPermanentlyDelete={handlePermanentlyDeleteSelected}
+            />
           )}
         </div>
 
@@ -1249,116 +1148,18 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
 
         {/* History Rewind Panel */}
         {showHistoryPanel && activeWorkspace && (
-          <div ref={historyPanelRef} style={styles.historyPanel}>
-            {historyLoading && (
-              <div style={styles.historyEmpty}>Loading history...</div>
-            )}
-            {!historyLoading && historyEntries.length === 0 && (
-              <div style={styles.historyEmpty}>
-                No history yet. Snapshots are saved automatically as you browse.
-              </div>
-            )}
-            {!historyLoading && historyEntries.length > 0 && (() => {
-              const entry = historyEntries[historyIndex];
-              if (!entry) return null;
-              const timeLabel = formatTimeAgo(new Date(entry.timestamp));
-              const canRewind = historyIndex < historyEntries.length - 1;
-              const canForward = historyIndex > 0;
-
-              return (
-                <>
-                  {/* Header */}
-                  <div style={styles.historyPanelHeader}>
-                    <span style={styles.historyPanelTitle}>Previously open</span>
-                    <div style={styles.historyPanelHeaderRight}>
-                      <span style={styles.historyEntryTabCount}>
-                        {historyIndex + 1} / {historyEntries.length}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Tab list for current entry */}
-                  <div style={styles.historyPanelBody}>
-                    {entry.tabs.map((t, i) => (
-                      <div key={i} style={styles.historyTab}>
-                        {t.faviconUrl ? (
-                          <img src={t.faviconUrl} style={styles.historyTabFavicon} alt="" />
-                        ) : (
-                          <div style={styles.historyTabFaviconPlaceholder} />
-                        )}
-                        <span style={styles.historyTabTitle}>{t.title || t.url}</span>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Navigation bar: rewind / time / forward */}
-                  <div style={styles.historyNavBar}>
-                    <button
-                      style={{
-                        ...styles.historyNavButton,
-                        opacity: canRewind ? 1 : 0.3,
-                        cursor: canRewind ? 'pointer' : 'default',
-                      }}
-                      disabled={!canRewind}
-                      onClick={() => { setHistoryIndex((i) => i + 1); setConfirmRestore(false); }}
-                      title="Older"
-                    >
-                      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M7 3L2 8L7 13V3ZM14 3L9 8L14 13V3Z"/></svg>
-                    </button>
-                    <span style={styles.historyNavTime}>{timeLabel}</span>
-                    <button
-                      style={{
-                        ...styles.historyNavButton,
-                        opacity: canForward ? 1 : 0.3,
-                        cursor: canForward ? 'pointer' : 'default',
-                      }}
-                      disabled={!canForward}
-                      onClick={() => { setHistoryIndex((i) => i - 1); setConfirmRestore(false); }}
-                      title="Newer"
-                    >
-                      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M9 3L14 8L9 13V3ZM2 3L7 8L2 13V3Z"/></svg>
-                    </button>
-                  </div>
-
-                  {/* Action bar: cancel / restore */}
-                  <div style={styles.historyActionBar}>
-                    {!confirmRestore ? (
-                      <>
-                        <button style={styles.historyCancelButton} onClick={closeHistoryPanel}>
-                          Cancel
-                        </button>
-                        <button
-                          style={styles.historyRestoreButton}
-                          onClick={() => setConfirmRestore(true)}
-                        >
-                          Restore {entry.tabs.length} tab{entry.tabs.length !== 1 ? 's' : ''}
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <span style={{ fontSize: '12px', color: '#f59e0b', fontWeight: 500 }}>
-                          Replace current tabs?
-                        </span>
-                        <button
-                          style={styles.historyRestoreConfirm}
-                          disabled={restoringHistory}
-                          onClick={handleRestoreHistoryEntry}
-                        >
-                          {restoringHistory ? 'Restoring...' : 'Yes, restore'}
-                        </button>
-                        <button
-                          style={styles.historyCancelButton}
-                          onClick={() => setConfirmRestore(false)}
-                        >
-                          No
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </>
-              );
-            })()}
-          </div>
+          <HistoryPanel
+            ref={historyPanelRef}
+            loading={historyLoading}
+            entries={historyEntries}
+            index={historyIndex}
+            setIndex={setHistoryIndex}
+            confirmRestore={confirmRestore}
+            setConfirmRestore={setConfirmRestore}
+            restoring={restoringHistory}
+            onRestore={handleRestoreHistoryEntry}
+            onClose={closeHistoryPanel}
+          />
         )}
 
         {/* Content Body */}
