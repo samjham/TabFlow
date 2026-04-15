@@ -1638,6 +1638,7 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                 const draggedTab = localTabs.find((t) => t.id === dragTabId);
                 const state = dragRef.current;
                 if (!draggedTab || !state) return null;
+                const dragAccent = activeWorkspace?.color || '#6c8cff';
                 return (
                   <div
                     style={{
@@ -1648,14 +1649,13 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                       zIndex: 9999,
                       pointerEvents: 'none',
                       transform: 'scale(1.03)',
-                      // Soft amber halo (no spread, all blur) to match TabCard's
-                      // pressed-state aesthetic. The previous first layer was
-                      // `0 0 0 2px ...` — a zero-blur ring that read as a hard
-                      // edge the instant a drag started.
+                      // Soft halo in the workspace accent color (no spread,
+                      // all blur) so the glow reads as a continuation of the
+                      // pressed state rather than shifting hue at drag start.
                       boxShadow: [
-                        '0 0 15px 0px rgba(255, 200, 120, 0.5)',
-                        '0 0 35px 0px rgba(255, 180, 80, 0.3)',
-                        '0 0 70px 0px rgba(255, 180, 80, 0.15)',
+                        `0 0 15px 0px ${dragAccent}80`,
+                        `0 0 35px 0px ${dragAccent}4d`,
+                        `0 0 70px 0px ${dragAccent}26`,
                         '0 10px 30px 0px rgba(0, 0, 0, 0.4)',
                       ].join(', '),
                       borderRadius: '8px',
