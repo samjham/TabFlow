@@ -642,11 +642,15 @@ export class SupabaseSyncClient {
       throw new Error(`Failed to pull tabs: ${tabsError.message}`);
     }
 
-    // Decrypt and save workspaces
+    // Decrypt and save workspaces.
+    // Some workspace fields (shortName) are local-only — the Supabase
+    // schema has no column for them — so we must merge with the existing
+    // local record to avoid wiping those fields on every pull.
     if (workspacesData && workspacesData.length > 0) {
       const decryptedWorkspaces = await Promise.all(
         workspacesData.map(async (ws) => {
           const decryptedName = await decrypt(ws.name, this.encryptionKey);
+          const existing = await this.storage.getWorkspace(ws.id);
           return {
             id: ws.id,
             userId: this.localUserId,
@@ -657,6 +661,7 @@ export class SupabaseSyncClient {
             isActive: ws.is_active,
             updatedAt: new Date(ws.updated_at),
             version: ws.version,
+            shortName: existing?.shortName,
           } as Workspace;
         })
       );
@@ -754,6 +759,11 @@ export class SupabaseSyncClient {
         }
       } else if (payload.new) {
         const decryptedName = await decrypt(payload.new.name, this.encryptionKey);
+        // Preserve local-only fields (shortName) that the Supabase schema
+        // doesn't track. Without this merge, every remote echo — including
+        // our own push-echo after the 5-second recentlyPushedIds window —
+        // would wipe the user's custom pinned-tab label.
+        const existing = await this.storage.getWorkspace(payload.new.id);
         const workspace: Workspace = {
           id: payload.new.id,
           userId: this.localUserId,
@@ -764,6 +774,7 @@ export class SupabaseSyncClient {
           isActive: payload.new.is_active,
           updatedAt: new Date(payload.new.updated_at),
           version: payload.new.version,
+          shortName: existing?.shortName,
         };
 
         await this.storage.saveWorkspace(workspace);

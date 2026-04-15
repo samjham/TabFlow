@@ -14,6 +14,7 @@
 import { Tab } from '@tabflow/core';
 import { NativeHostClient } from './NativeHostClient';
 import { getExtensionBaseUrl } from '../browser-compat';
+import { canonicalizeUrl, computeTabId } from '../utils/tabId';
 
 /** URLs that should never be saved as workspace tabs */
 const EXCLUDED_URL_PREFIXES = [
@@ -240,14 +241,25 @@ export class TabManager {
   /**
    * Saves all current browser tabs to a workspace in storage.
    *
-   * REPLACE chrome-* records, PRESERVE moved-* records.
-   * - Deletes old chrome-* records (stale IDs from previous switches)
-   * - Saves fresh chrome-* records from current Chrome tabs
-   * - Never touches moved-* records (tabs moved from other workspaces
-   *   that haven't been materialized as Chrome tabs yet)
+   * DETERMINISTIC-ID MODEL (post-migration):
+   * Tab IDs are derived from `workspaceId | canonicalUrl | createdAt`. The
+   * same tab keeps the same ID across snapshots, across browsers, and
+   * forever. Supabase upserts become idempotent.
    *
-   * This prevents duplication (old stale chrome-* records accumulating)
-   * while preserving cross-workspace moves.
+   * Matching strategy:
+   *   1. For each live Chrome tab, find an existing record in the same
+   *      workspace whose canonicalized URL matches and hasn't been claimed
+   *      by an earlier match. Prefer the oldest-`createdAt` record (so
+   *      the "first" duplicate tab stays the "first" across restarts).
+   *   2. If matched, REUSE its ID and `createdAt`. Update mutable fields
+   *      (title, favicon, sortOrder, updatedAt, lastAccessed).
+   *   3. If not matched, MINT a new record with `createdAt = now` and
+   *      compute a deterministic ID from it.
+   *   4. Any existing `chrome-`, `restart-`, or `tab-` record that wasn't
+   *      matched to a live tab is deleted (tab was closed).
+   *   5. `moved-` and `dup-` records are preserved verbatim — they
+   *      represent cross-workspace moves that haven't materialized as
+   *      Chrome tabs yet.
    */
   async saveCurrentTabsToWorkspace(workspaceId: string, storage: any, windowId?: number): Promise<void> {
     try {
@@ -267,33 +279,143 @@ export class TabManager {
         currentTabs.splice(TabManager.MAX_RESTORE_TABS);
       }
 
-      // Step 1: Delete old chrome-* and restart-* records for this workspace.
-      // When we have actual Chrome tabs open, they are the complete
-      // source of truth for chrome-* prefixes. However, moved-* and dup-*
-      // records represent tabs from other workspaces that may not have
-      // been materialized as Chrome tabs yet — preserve those.
-      const existingTabs = await storage.getTabs(workspaceId);
+      const existingTabs: Tab[] = await storage.getTabs(workspaceId);
+
+      // ALL existing records participate in URL matching — including
+      // moved-*/dup-* placeholders. If a placeholder's URL matches a
+      // currently-open Chrome tab, we consume it and replace with a
+      // deterministic ID. If it's unmatched, we preserve it only if
+      // it's a placeholder (still awaiting materialization on a future
+      // workspace switch); otherwise it represents a closed tab and
+      // gets deleted.
+      const matchableByUrl = new Map<string, Tab[]>();
+      for (const t of existingTabs) {
+        const key = canonicalizeUrl(t.url);
+        const list = matchableByUrl.get(key) ?? [];
+        list.push(t);
+        matchableByUrl.set(key, list);
+      }
+      // Within each URL bucket, sort oldest-first so we consume existing
+      // records in the order their tabs were originally added. `createdAt`
+      // may be missing on legacy records — fall back to `updatedAt`.
+      for (const list of matchableByUrl.values()) {
+        list.sort((a, b) => {
+          const aT = (a.createdAt ?? a.updatedAt) as Date;
+          const bT = (b.createdAt ?? b.updatedAt) as Date;
+          return new Date(aT).getTime() - new Date(bT).getTime();
+        });
+      }
+
+      const now = new Date();
+      const recordsToSave: Tab[] = [];
+
+      // Tracking for the cleanup sweep:
+      //   reuseIds       = existing records we kept verbatim (same ID).
+      //   rewriteIds     = existing records whose URL was claimed but we
+      //                    minted a new deterministic ID; the old record
+      //                    must be deleted.
+      const reuseIds = new Set<string>();
+      const rewriteIds = new Set<string>();
+      let reused = 0;
+      let minted = 0;
+      let rewritten = 0;
+
+      for (let i = 0; i < currentTabs.length; i++) {
+        const live = currentTabs[i];
+        const key = canonicalizeUrl(live.url);
+        const bucket = matchableByUrl.get(key);
+        const match = bucket && bucket.length > 0 ? bucket.shift()! : undefined;
+
+        const isLegacyId = (id: string) =>
+          id.startsWith('chrome-') ||
+          id.startsWith('restart-') ||
+          id.startsWith('moved-') ||
+          id.startsWith('dup-');
+
+        if (match && !isLegacyId(match.id)) {
+          // Existing deterministic record — reuse verbatim.
+          reuseIds.add(match.id);
+          recordsToSave.push({
+            ...match,
+            workspaceId,
+            title: live.title,
+            faviconUrl: live.faviconUrl ?? match.faviconUrl,
+            isPinned: live.isPinned,
+            sortOrder: i,
+            lastAccessed: now,
+            updatedAt: now,
+          });
+          reused++;
+        } else if (match) {
+          // Legacy ID match — claim its createdAt, mint a new deterministic ID.
+          const createdAt = (match.createdAt ?? match.updatedAt) as Date;
+          const id = await computeTabId(workspaceId, live.url, new Date(createdAt));
+          rewriteIds.add(match.id);
+          recordsToSave.push({
+            id,
+            workspaceId,
+            url: live.url,
+            title: live.title,
+            faviconUrl: live.faviconUrl ?? match.faviconUrl,
+            sortOrder: i,
+            isPinned: live.isPinned,
+            lastAccessed: now,
+            updatedAt: now,
+            createdAt: new Date(createdAt),
+          });
+          rewritten++;
+        } else {
+          // No match — fresh tab. createdAt = now.
+          const createdAt = now;
+          const id = await computeTabId(workspaceId, live.url, createdAt);
+          recordsToSave.push({
+            id,
+            workspaceId,
+            url: live.url,
+            title: live.title,
+            faviconUrl: live.faviconUrl,
+            sortOrder: i,
+            isPinned: live.isPinned,
+            lastAccessed: now,
+            updatedAt: now,
+            createdAt,
+          });
+          minted++;
+        }
+      }
+
+      // Cleanup sweep over the ORIGINAL existing records.
+      //   reuseIds   → already in recordsToSave with same ID, skip.
+      //   rewriteIds → legacy record replaced by a new deterministic ID, delete the old row.
+      //   neither    → truly unmatched. Preserve if moved-*/dup-* (pending
+      //                materialization), otherwise delete (closed tab).
       let deleted = 0;
-      for (const tab of existingTabs) {
-        if (tab.id.startsWith('moved-') || tab.id.startsWith('dup-')) {
-          // Preserve — they'll be materialized as Chrome tabs on the
-          // next workspace switch or restore
+      let preservedPending = 0;
+      for (const t of existingTabs) {
+        if (reuseIds.has(t.id)) continue;
+        if (rewriteIds.has(t.id)) {
+          await storage.deleteTab(t.id);
+          deleted++;
           continue;
         }
-        await storage.deleteTab(tab.id);
+        if (t.id.startsWith('moved-') || t.id.startsWith('dup-')) {
+          preservedPending++;
+          continue;
+        }
+        await storage.deleteTab(t.id);
         deleted++;
       }
 
-      // Step 2: Save fresh chrome-* records from current Chrome tabs
-      let saved = 0;
-      for (let i = 0; i < currentTabs.length; i++) {
-        const tab = { ...currentTabs[i], workspaceId, sortOrder: i };
-        await storage.saveTab(tab);
-        saved++;
+      // Persist the new/updated records.
+      for (const t of recordsToSave) {
+        await storage.saveTab(t);
       }
 
-      const preservedPending = existingTabs.filter((t) => t.id.startsWith('moved-') || t.id.startsWith('dup-')).length;
-      console.log(`[TabFlow] Saved ${saved} tabs to workspace ${workspaceId} (replaced ${deleted} old records, preserved ${preservedPending} pending records)`);
+      console.log(
+        `[TabFlow] Saved ${recordsToSave.length} tabs to workspace ${workspaceId} ` +
+        `(reused ${reused}, rewritten ${rewritten}, minted ${minted}, ` +
+        `deleted ${deleted}, preserved ${preservedPending} pending)`
+      );
     } catch (error) {
       console.error('[TabFlow] Error saving tabs to workspace:', error);
     }
@@ -436,14 +558,17 @@ export class TabManager {
             windowId: windowId,
           });
 
-          if (storageAdapter && created.id) {
-            const newId = `chrome-${created.id}`;
-            if (tab.id !== newId) {
-              await storageAdapter.deleteTab(tab.id);
-              await storageAdapter.saveTab({ ...tab, id: newId });
-              console.log(`[TabFlow] Remapped tab ID: ${tab.id} → ${newId}`);
-            }
-          }
+          // DETERMINISTIC-ID MODEL: We no longer remap to `chrome-<id>` on
+          // restore. The storage record's ID is content-derived and stays
+          // stable. The next snapshot will match the newly-opened Chrome
+          // tab back to this record by URL and just update display fields.
+          //
+          // For legacy records (moved-*/dup-*) whose tabs are being
+          // materialized here, we leave the legacy ID alone — the next
+          // snapshot will rewrite it to a tab-<hash> ID via the legacy-match
+          // path in saveCurrentTabsToWorkspace.
+          void created; // silence unused-variable warning
+          void storageAdapter;
         } catch (error) {
           console.error(`[TabFlow] Error creating suspended tab for ${tab.url}:`, error);
         }
@@ -592,6 +717,45 @@ export class TabManager {
       console.error('[TabFlow] Error finding main window:', error);
       return undefined;
     }
+  }
+
+  /**
+   * Builds a map of canonical URL → live Chrome tab IDs for all tabs in
+   * the main window. Used by handlers that need to operate on Chrome tabs
+   * by storage-tab URL (close, move, reorder) now that deterministic storage
+   * IDs no longer carry the Chrome numeric tab ID.
+   *
+   * Values are arrays because duplicate URLs are allowed — the user can
+   * have the same URL open as multiple tiles, each backed by its own
+   * Chrome tab. Callers that consume one-at-a-time (e.g. "close this
+   * specific tile") should `shift()` off the front of the array so later
+   * calls within the same operation don't re-hit the same Chrome tab.
+   *
+   * Suspended-tab URLs are unwrapped to their real underlying URL so
+   * suspended tabs match their storage records.
+   */
+  async buildMainWindowUrlIndex(): Promise<Map<string, number[]>> {
+    const map = new Map<string, number[]>();
+    const windowId = await this.getMainWindowId();
+    if (windowId === undefined) return map;
+    const tabs = await chrome.tabs.query({ windowId });
+    const suspendedPrefix = `${getExtensionBaseUrl()}suspended.html`;
+    for (const t of tabs) {
+      if (!t.id || !t.url) continue;
+      // Skip the pinned TabFlow tab itself
+      if (t.id === this.cachedTabFlowTabId) continue;
+      let realUrl = t.url;
+      if (t.url.startsWith(suspendedPrefix)) {
+        try {
+          realUrl = new URL(t.url).searchParams.get('url') || t.url;
+        } catch { /* ignore */ }
+      }
+      const key = canonicalizeUrl(realUrl);
+      const arr = map.get(key);
+      if (arr) arr.push(t.id);
+      else map.set(key, [t.id]);
+    }
+    return map;
   }
 
   /**

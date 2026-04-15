@@ -16,6 +16,7 @@ import { WorkspaceEngine } from '@tabflow/core';
 import { deriveKey } from '@tabflow/core';
 import { encrypt, decrypt } from '@tabflow/core/crypto/encryption';
 import { getExtensionBaseUrl, getExtensionPageUrl } from '../browser-compat';
+import { canonicalizeUrl, computeTabId } from '../utils/tabId';
 
 /**
  * Known plaintext encrypted with the user's key and stored in user_settings.canary.
@@ -538,6 +539,122 @@ async function renameStaleTabIds(): Promise<void> {
 }
 
 /**
+ * One-time migration to deterministic tab IDs (tab-<hash>).
+ *
+ * Background: Pre-migration, tab storage IDs were `chrome-<numericId>` where
+ * the numeric ID came from Chrome's in-memory tab counter. Chrome and
+ * Firefox each count independently from 1, so their IDs inevitably collide
+ * when synced via Supabase — Firefox's gmail tab at `chrome-1234` overwrites
+ * Chrome's github tab at `chrome-1234`. See §9 of CLAUDE.md for the full
+ * incident writeup and the 2026-04-15 rollback.
+ *
+ * This migration walks every workspace's tabs and rewrites non-deterministic
+ * IDs (`chrome-*`, `restart-*`, `moved-*`, `dup-*`) into `tab-<16hex>` where
+ * the hash is computed from (workspaceId, canonicalUrl, createdAt). On
+ * legacy records, `createdAt` doesn't exist, so we use `updatedAt` as a
+ * best-effort substitute — it's the timestamp of the last change to the
+ * record, which is the closest proxy we have for "when this tab was first
+ * seen." Post-migration, every new record carries a real `createdAt`.
+ *
+ * Hash-collision handling: within a workspace, if two legacy records happen
+ * to canonicalize to the same URL AND have the same `updatedAt` to the
+ * millisecond (extremely unlikely but possible), the second record's
+ * `createdAt` gets bumped by 1ms until the computed ID is unique.
+ *
+ * Idempotency: gated by `tabIdMigrationV1Done` in chrome.storage.local. Runs
+ * at most once per extension install. If the migration crashes partway,
+ * the flag isn't set and it runs again on next startup — intermediate
+ * state is benign because the algorithm is "replace if legacy ID, skip
+ * if already tab-*".
+ */
+async function migrateTabIdsV1(): Promise<void> {
+  try {
+    const { tabIdMigrationV1Done } = await chrome.storage.local.get('tabIdMigrationV1Done');
+    if (tabIdMigrationV1Done) return;
+
+    console.log('[TabFlow] Tab-ID migration v1 starting');
+    const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+
+    let totalRewritten = 0;
+    let totalUpgradedTabPrefix = 0;
+    let totalSkipped = 0;
+
+    for (const ws of workspaces) {
+      const tabs = await storage.getTabs(ws.id);
+      // Sort by updatedAt asc so the earliest record in any URL collision
+      // group keeps the most "original" createdAt.
+      const sorted = [...tabs].sort(
+        (a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime()
+      );
+
+      // Track IDs we've assigned in this workspace to resolve rare collisions.
+      const usedIds = new Set<string>(
+        sorted.filter((t) => t.id.startsWith('tab-')).map((t) => t.id)
+      );
+
+      for (const tab of sorted) {
+        const isLegacy =
+          tab.id.startsWith('chrome-') ||
+          tab.id.startsWith('restart-') ||
+          tab.id.startsWith('moved-') ||
+          tab.id.startsWith('dup-');
+
+        if (tab.id.startsWith('tab-')) {
+          // Already deterministic. Backfill createdAt if missing.
+          if (!tab.createdAt) {
+            await storage.saveTab({ ...tab, createdAt: new Date(tab.updatedAt) });
+            totalUpgradedTabPrefix++;
+          } else {
+            totalSkipped++;
+          }
+          continue;
+        }
+
+        if (!isLegacy) {
+          // Unknown ID shape — leave it alone to avoid data loss.
+          console.warn(`[TabFlow] Migration: unrecognized tab ID "${tab.id}", skipping`);
+          totalSkipped++;
+          continue;
+        }
+
+        // Compute deterministic ID using updatedAt as the createdAt proxy.
+        let candidateCreatedAt = new Date(tab.updatedAt);
+        let newId = await computeTabId(ws.id, tab.url, candidateCreatedAt);
+        // Collision avoidance: bump by 1ms until unique within this workspace.
+        while (usedIds.has(newId)) {
+          candidateCreatedAt = new Date(candidateCreatedAt.getTime() + 1);
+          newId = await computeTabId(ws.id, tab.url, candidateCreatedAt);
+        }
+        usedIds.add(newId);
+
+        // Write new record BEFORE deleting old, so we never have a window
+        // where the tab is lost entirely.
+        await storage.saveTab({
+          ...tab,
+          id: newId,
+          url: tab.url, // keep original URL (canonicalization is only for matching)
+          createdAt: candidateCreatedAt,
+        });
+        if (tab.id !== newId) {
+          await storage.deleteTab(tab.id);
+        }
+        totalRewritten++;
+      }
+    }
+
+    await chrome.storage.local.set({ tabIdMigrationV1Done: true });
+    console.log(
+      `[TabFlow] Tab-ID migration v1 complete: rewrote ${totalRewritten} legacy records, ` +
+      `backfilled createdAt on ${totalUpgradedTabPrefix} existing tab-* records, ` +
+      `skipped ${totalSkipped}`
+    );
+  } catch (error) {
+    // Don't set the flag on error — migration will retry on next startup.
+    console.error('[TabFlow] Tab-ID migration v1 failed:', error);
+  }
+}
+
+/**
  * Run the Chrome restart startup flow.
  *
  * LOCKED-DOWN approach: This does NOT modify workspace data or tab records.
@@ -895,6 +1012,11 @@ chrome.runtime.onStartup.addListener(async () => {
     }
   }
 
+  // One-time migration to deterministic tab IDs. Runs once per install,
+  // gated by tabIdMigrationV1Done. Safe to run on every startup — it's a
+  // no-op after the first pass. See migrateTabIdsV1 for details.
+  await migrateTabIdsV1();
+
   // Check if there's a pending Chrome restart that wasn't completed
   // (e.g., the service worker was killed and restarted)
   const { pendingChromeRestart, tabFlowTabId } = await chrome.storage.local.get([
@@ -1014,6 +1136,10 @@ async function handleMoveTabsInServiceWorker(payload: any): Promise<Response> {
   let startOrder = existingTargetTabs.length;
   let movedCount = 0;
 
+  // Deterministic storage IDs no longer embed a Chrome numeric tab ID, so
+  // we match tiles to live Chrome tabs by canonical URL instead.
+  const urlIndex = await tabManager.buildMainWindowUrlIndex();
+
   for (const ws of allWorkspaces) {
     const wsTabs = await storage.getTabs(ws.id);
     for (const tab of wsTabs) {
@@ -1034,9 +1160,10 @@ async function handleMoveTabsInServiceWorker(payload: any): Promise<Response> {
         console.log(`[TabFlow] Move: created ${newId} for "${tab.title}" in ${targetWorkspaceId}`);
         movedCount++;
 
-        const match = tab.id.match(/^chrome-(\d+)$/);
-        if (match) {
-          chromeIdsToClose.push(parseInt(match[1], 10));
+        const canonical = canonicalizeUrl(tab.url);
+        const chromeIds = urlIndex.get(canonical);
+        if (chromeIds && chromeIds.length > 0) {
+          chromeIdsToClose.push(chromeIds.shift()!);
         }
       }
     }

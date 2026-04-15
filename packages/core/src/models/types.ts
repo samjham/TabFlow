@@ -47,7 +47,17 @@ export interface Workspace {
  * Represents a browser tab within a workspace.
  */
 export interface Tab {
-  /** Unique identifier for the tab */
+  /** Unique identifier for the tab.
+   *
+   * For tabs created after the deterministic-ID migration (v1), this is
+   * `tab-<16hex>` where <16hex> is the first 16 hex chars of SHA-256 over
+   * `workspaceId|canonicalUrl|createdAt.toISOString()`. IDs are stable
+   * across browsers (Chrome/Firefox) and across snapshots — the same tab
+   * keeps the same ID forever, so Supabase upserts are idempotent.
+   *
+   * Legacy records may still use `chrome-<numericId>`, `restart-<ts>-<n>`,
+   * `moved-<...>`, or `dup-<...>` prefixes. Migration rewrites them.
+   */
   id: string;
   /** ID of the workspace this tab belongs to */
   workspaceId: string;
@@ -65,6 +75,13 @@ export interface Tab {
   lastAccessed: Date;
   /** Timestamp of the last update to this tab */
   updatedAt: Date;
+  /** Timestamp of when this tab was first added to its workspace.
+   *
+   * Used as the tiebreaker in the deterministic ID formula so that two
+   * tabs pointing at the same URL in the same workspace get distinct
+   * stable IDs. Optional for backward compatibility with pre-migration
+   * records; migration backfills it from `updatedAt`. */
+  createdAt?: Date;
 }
 
 /**

@@ -11,6 +11,7 @@ import { WorkspaceEngine } from '@tabflow/core';
 import type { Workspace, Tab, StorageAdapter } from '@tabflow/core';
 import { TabManager } from './TabManager';
 import { getExtensionBaseUrl } from '../browser-compat';
+import { canonicalizeUrl } from '../utils/tabId';
 
 /** The local user ID (single-user for now, auth comes later) */
 const LOCAL_USER_ID = 'local-user';
@@ -326,37 +327,68 @@ export class MessageHandler {
   }
 
   /**
-   * Remove a tab from storage (user clicked X on a tab card in the UI)
+   * Remove a tab from storage (user clicked X on a tab card in the UI).
+   *
+   * Deterministic storage IDs no longer embed a Chrome numeric tab ID, so
+   * we look up the storage record's URL first and match it against the
+   * main window's live Chrome tabs by canonical URL to decide which
+   * Chrome tab (if any) to close.
    */
   private async handleRemoveTab(payload: any): Promise<Response> {
     const { tabId } = payload || {};
     if (!tabId) return { success: false, error: 'tabId is required' };
 
+    // Find the tab's URL before deleting — we need it to close the Chrome
+    // tab (storage IDs no longer embed a Chrome numeric tab ID).
+    const workspaces = await this.storage.getWorkspaces(LOCAL_USER_ID);
+    let targetUrl: string | null = null;
+    for (const ws of workspaces) {
+      const wsTabs = await this.storage.getTabs(ws.id);
+      const found = wsTabs.find((t) => t.id === tabId);
+      if (found) {
+        targetUrl = found.url;
+        break;
+      }
+    }
+
     // Delete from storage
     await this.engine.removeTab(tabId);
 
-    // Also close the actual Chrome tab if it's a live tab
-    const match = tabId.match(/^chrome-(\d+)$/);
-    if (match) {
-      const chromeTabId = parseInt(match[1], 10);
+    // Close the matching live Chrome tab, if any
+    if (targetUrl) {
       try {
-        await chrome.tabs.remove(chromeTabId);
-        console.log(`[TabFlow] Removed tab ${tabId} (closed Chrome tab ${chromeTabId})`);
-      } catch {
-        console.log(`[TabFlow] Removed tab ${tabId} (Chrome tab already closed)`);
+        const urlIndex = await this.tabManager.buildMainWindowUrlIndex();
+        const canonical = canonicalizeUrl(targetUrl);
+        const chromeIds = urlIndex.get(canonical);
+        if (chromeIds && chromeIds.length > 0) {
+          const chromeTabId = chromeIds.shift()!;
+          try {
+            await chrome.tabs.remove(chromeTabId);
+            console.log(`[TabFlow] Removed tab ${tabId} (closed Chrome tab ${chromeTabId} via URL match)`);
+          } catch {
+            console.log(`[TabFlow] Removed tab ${tabId} (Chrome tab already closed)`);
+          }
+          return { success: true, data: { removedTabId: tabId } };
+        }
+      } catch (e) {
+        console.warn('[TabFlow] Error closing Chrome tab on remove:', e);
       }
-    } else {
-      console.log(`[TabFlow] Removed tab ${tabId}`);
     }
 
+    console.log(`[TabFlow] Removed tab ${tabId}`);
     return { success: true, data: { removedTabId: tabId } };
   }
 
   /**
    * Close all tabs in a workspace (user clicked "Close All Tabs" in the UI).
-   * 1. Closes actual Chrome tabs in the main window (matching stored IDs)
+   * 1. Closes actual Chrome tabs in the main window (matching stored URLs)
    * 2. Closes any hidden window for this workspace
    * 3. Deletes all tab records from storage
+   *
+   * Since deterministic storage IDs don't embed Chrome numeric tab IDs,
+   * we match storage records to live Chrome tabs by canonical URL. The
+   * URL index supports duplicates, so N tiles with the same URL correctly
+   * map to N Chrome tabs.
    */
   private async handleCloseAllTabs(payload: any): Promise<Response> {
     const { workspaceId } = payload || {};
@@ -365,12 +397,14 @@ export class MessageHandler {
     const tabs = await this.storage.getTabs(workspaceId);
     let closedCount = 0;
 
-    // Step 1: Close actual Chrome tabs that match stored chrome-* IDs
+    // Step 1: Match storage tabs to live Chrome tabs by canonical URL and close them
     const chromeIdsToClose: number[] = [];
+    const urlIndex = await this.tabManager.buildMainWindowUrlIndex();
     for (const tab of tabs) {
-      const match = tab.id.match(/^chrome-(\d+)$/);
-      if (match) {
-        chromeIdsToClose.push(parseInt(match[1], 10));
+      const canonical = canonicalizeUrl(tab.url);
+      const chromeIds = urlIndex.get(canonical);
+      if (chromeIds && chromeIds.length > 0) {
+        chromeIdsToClose.push(chromeIds.shift()!);
       }
     }
 
@@ -434,6 +468,11 @@ export class MessageHandler {
     let movedCount = 0;
     const chromeTabIdsToClose: number[] = [];
 
+    // Build the URL index once up front — deterministic storage IDs no
+    // longer embed a Chrome numeric tab ID, so we match tiles to live
+    // Chrome tabs by canonical URL.
+    const urlIndex = await this.tabManager.buildMainWindowUrlIndex();
+
     for (const ws of allWorkspaces) {
       const wsTabs = await this.storage.getTabs(ws.id);
       for (const tab of wsTabs) {
@@ -443,10 +482,11 @@ export class MessageHandler {
           await this.storage.saveTab(tab);
           movedCount++;
 
-          // Extract the Chrome tab ID so we can close it from the main window
-          const match = tab.id.match(/^chrome-(\d+)$/);
-          if (match) {
-            chromeTabIdsToClose.push(parseInt(match[1], 10));
+          // Map this tile to a live Chrome tab by URL so we can close it
+          const canonical = canonicalizeUrl(tab.url);
+          const chromeIds = urlIndex.get(canonical);
+          if (chromeIds && chromeIds.length > 0) {
+            chromeTabIdsToClose.push(chromeIds.shift()!);
           }
         }
       }
@@ -897,9 +937,10 @@ export class MessageHandler {
    * Reorder tabs in both Chrome and storage.
    * Payload: { orderedTabIds: string[] } — tab IDs in the desired order.
    *
-   * The tab IDs are TabFlow IDs like "chrome-12345". We extract the Chrome
-   * tab IDs and call chrome.tabs.move to reposition them in the browser,
-   * then update sortOrder in storage to persist the order.
+   * Tab IDs are deterministic storage IDs (`tab-<16hex>`) that no longer
+   * embed a Chrome numeric tab ID. We match each storage record to its
+   * live Chrome tab by canonical URL, call chrome.tabs.move to reposition
+   * the browser tabs, then update sortOrder in storage to persist the order.
    */
   private async handleReorderTabs(payload: any): Promise<Response> {
     const { orderedTabIds } = payload || {};
@@ -911,16 +952,28 @@ export class MessageHandler {
         return { success: false, error: 'Main window not found' };
       }
 
+      // Look up storage records for the ordered IDs (from the active workspace)
+      const workspaces = await this.storage.getWorkspaces('local-user');
+      const activeWorkspace = workspaces.find((ws) => ws.isActive);
+      const activeTabs = activeWorkspace
+        ? await this.storage.getTabs(activeWorkspace.id)
+        : [];
+      const tabsById = new Map(activeTabs.map((t) => [t.id, t] as const));
+
       // The TabFlow pinned tab is always at index 0.
       // Workspace tabs start at index 1.
       const startIndex = 1;
 
-      // Move Chrome tabs to match the new order
+      // Build the URL index and move Chrome tabs to match the new order
+      const urlIndex = await this.tabManager.buildMainWindowUrlIndex();
       for (let i = 0; i < orderedTabIds.length; i++) {
         const tabId = orderedTabIds[i] as string;
-        const match = tabId.match(/^chrome-(\d+)$/);
-        if (match) {
-          const chromeTabId = parseInt(match[1], 10);
+        const storageTab = tabsById.get(tabId);
+        if (!storageTab) continue;
+        const canonical = canonicalizeUrl(storageTab.url);
+        const chromeIds = urlIndex.get(canonical);
+        if (chromeIds && chromeIds.length > 0) {
+          const chromeTabId = chromeIds.shift()!;
           try {
             await chrome.tabs.move(chromeTabId, { index: startIndex + i });
           } catch {
@@ -930,12 +983,9 @@ export class MessageHandler {
       }
 
       // Update sortOrder in storage
-      const workspaces = await this.storage.getWorkspaces('local-user');
-      const activeWorkspace = workspaces.find((ws) => ws.isActive);
       if (activeWorkspace) {
         for (let i = 0; i < orderedTabIds.length; i++) {
-          const tabs = await this.storage.getTabs(activeWorkspace.id);
-          const tab = tabs.find((t) => t.id === orderedTabIds[i]);
+          const tab = tabsById.get(orderedTabIds[i] as string);
           if (tab) {
             tab.sortOrder = i;
             tab.updatedAt = new Date();
