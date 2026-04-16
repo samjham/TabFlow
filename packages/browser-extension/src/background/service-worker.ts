@@ -300,7 +300,21 @@ async function initializeSync(userId: string) {
     //   - RESTORE_FROM_CLOUD (explicit user button)
     //   - CLAIM_ACTIVE_DEVICE (when this device takes over as active)
     // This avoids pulling every time the service worker wakes up.
-    console.log('[TabFlow] Sync initialized — pull on claim / restore only');
+
+    // If this device is the active device, do a full sync push to clean up
+    // any orphaned cloud rows. This runs after every extension reload so the
+    // cloud stays an exact mirror of local state.
+    if (syncClient.isActiveDevice && (await isSafeToPush())) {
+      try {
+        syncClient.setPushing(true);
+        await syncClient.fullSyncPush(userId);
+        syncClient.setPushing(false);
+        console.log('[TabFlow] Startup full sync push complete');
+      } catch (pushErr) {
+        syncClient.setPushing(false);
+        console.warn('[TabFlow] Startup full sync push failed:', pushErr);
+      }
+    }
 
     console.log('[TabFlow] Sync initialized for user:', userId);
   } catch (error) {
@@ -1396,7 +1410,7 @@ chrome.runtime.onMessage.addListener(
             // Temporarily suppress the realtime push echo guard so the
             // pulled rows go straight into storage.
             syncClient.setPushing(true);
-            await syncClient.pullAll(syncUserId);
+            await syncClient.pullAll(syncUserId, true /* destructive */);
             syncClient.setPushing(false);
 
             // Count what we now have locally so the UI can confirm.
@@ -1541,10 +1555,11 @@ async function claimActiveDeviceWithMaterialization(): Promise<{ success: boolea
     return { success: false, error: 'Sync not initialized' };
   }
 
-  // ── Step 1: Pull from cloud ───────────────────────────────────────
+  // ── Step 1: Destructive pull — clear local data, then pull from cloud ──
+  // This gives us an exact mirror of the cloud with no leftover junk.
   try {
     syncClient.setPushing(true);
-    await syncClient.pullAll(syncUserId);
+    await syncClient.pullAll(syncUserId, true /* destructive */);
   } catch (pullErr) {
     syncClient.setPushing(false);
     if (pullErr instanceof DOMException || (pullErr as any)?.name === 'OperationError') {
@@ -1595,6 +1610,17 @@ async function claimActiveDeviceWithMaterialization(): Promise<{ success: boolea
     // ── Step 4: Claim on Supabase and enable push ───────────────────
     await syncClient.claimActiveDevice();
     await markSafeToPush('claim completed');
+
+    // ── Step 5: Full sync push — clean up orphaned cloud rows ───────
+    // Now that this device is active, make the cloud an exact mirror
+    // of our local state. This deletes stale workspaces/tabs that
+    // accumulated in the cloud from earlier corruption or other browsers.
+    try {
+      await syncClient.fullSyncPush(syncUserId);
+    } catch (pushErr) {
+      // Non-fatal — the cloud may have some junk but we're functional
+      console.warn('[TabFlow] Full sync push after claim failed:', pushErr);
+    }
 
     return { success: true };
   } finally {

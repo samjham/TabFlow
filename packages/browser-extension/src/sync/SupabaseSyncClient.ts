@@ -604,22 +604,104 @@ export class SupabaseSyncClient {
   }
 
   /**
-   * Performs an initial full sync from Supabase.
-   *
-   * Fetches all workspaces and tabs for the user, decrypts them,
-   * and writes them to local IndexedDB. Useful for initial sync on login.
-   *
-   * @param userId - The ID of the user to pull data for
-   * @returns Promise that resolves when the sync is complete
-   * @throws Error if the fetch or decryption fails
-   *
-   * @example
-   * ```ts
-   * await client.pullAll(userId);
-   * console.log('Initial sync complete');
-   * ```
+   * Wipes all local workspaces and tabs from IndexedDB.
+   * Used before a destructive pull so the local state becomes an exact
+   * mirror of the cloud, with no leftover junk from previous sessions.
    */
-  async pullAll(userId: string): Promise<void> {
+  async clearLocalData(): Promise<void> {
+    const localWorkspaces = await this.storage.getWorkspaces(this.localUserId);
+    for (const ws of localWorkspaces) {
+      const tabs = await this.storage.getTabs(ws.id);
+      for (const tab of tabs) {
+        await this.storage.deleteTab(tab.id);
+      }
+      await this.storage.deleteWorkspace(ws.id);
+    }
+    console.log(`[TabFlow] Cleared ${localWorkspaces.length} local workspaces`);
+  }
+
+  /**
+   * Pushes ALL local workspaces + tabs to the cloud AND deletes any
+   * cloud rows that don't exist locally. After this runs, the cloud
+   * is an exact mirror of local IndexedDB.
+   *
+   * Call this after a successful claim so the new active device's
+   * state immediately becomes the cloud truth.
+   */
+  async fullSyncPush(userId: string): Promise<void> {
+    // Get all local workspaces and tabs
+    const localWorkspaces = await this.storage.getWorkspaces(this.localUserId);
+    const localWorkspaceIds = new Set(localWorkspaces.map((ws) => ws.id));
+    const localTabIds = new Set<string>();
+
+    // Push all local workspaces and their tabs
+    for (const ws of localWorkspaces) {
+      await this.pushWorkspace({ ...ws, userId });
+      const tabs = await this.storage.getTabs(ws.id);
+      for (const tab of tabs) {
+        await this.pushTab(tab);
+        localTabIds.add(tab.id);
+      }
+    }
+
+    // Fetch cloud workspace IDs and delete orphans
+    const { data: cloudWorkspaces } = await this.supabase
+      .from('workspaces')
+      .select('id')
+      .eq('user_id', userId);
+
+    if (cloudWorkspaces) {
+      const orphanWorkspaceIds = cloudWorkspaces
+        .filter((cw) => !localWorkspaceIds.has(cw.id))
+        .map((cw) => cw.id);
+      if (orphanWorkspaceIds.length > 0) {
+        // Delete orphan tabs first (they reference the workspace)
+        await this.supabase
+          .from('tabs')
+          .delete()
+          .in('workspace_id', orphanWorkspaceIds);
+        await this.supabase
+          .from('workspaces')
+          .delete()
+          .in('id', orphanWorkspaceIds);
+        console.log(`[TabFlow] Deleted ${orphanWorkspaceIds.length} orphan workspace(s) from cloud`);
+      }
+    }
+
+    // Fetch cloud tab IDs and delete orphans
+    const { data: cloudTabs } = await this.supabase
+      .from('tabs')
+      .select('id')
+      .eq('user_id', userId);
+
+    if (cloudTabs) {
+      const orphanTabIds = cloudTabs
+        .filter((ct) => !localTabIds.has(ct.id))
+        .map((ct) => ct.id);
+      if (orphanTabIds.length > 0) {
+        // Delete in batches to avoid hitting Supabase limits
+        for (let i = 0; i < orphanTabIds.length; i += 100) {
+          const batch = orphanTabIds.slice(i, i + 100);
+          await this.supabase
+            .from('tabs')
+            .delete()
+            .in('id', batch);
+        }
+        console.log(`[TabFlow] Deleted ${orphanTabIds.length} orphan tab(s) from cloud`);
+      }
+    }
+
+    console.log(`[TabFlow] Full sync push complete: ${localWorkspaces.length} workspaces, ${localTabIds.size} tabs`);
+  }
+
+  /**
+   * Performs a full sync from Supabase — pulls all workspaces and tabs.
+   *
+   * When `destructive` is true (used during claim), clears all local
+   * workspaces and tabs first so the result is an exact mirror of the cloud.
+   * When false (default), does an additive upsert.
+   */
+  async pullAll(userId: string, destructive = false): Promise<void> {
     // Fetch all workspaces for the user
     const { data: workspacesData, error: workspacesError } = await this.supabase
       .from('workspaces')
@@ -638,6 +720,12 @@ export class SupabaseSyncClient {
 
     if (tabsError) {
       throw new Error(`Failed to pull tabs: ${tabsError.message}`);
+    }
+
+    // In destructive mode, clear all local data first so we get an exact
+    // mirror of the cloud with no leftover junk.
+    if (destructive) {
+      await this.clearLocalData();
     }
 
     // Decrypt and save workspaces.
@@ -748,6 +836,7 @@ export class SupabaseSyncClient {
 
   private async handleWorkspaceChange(payload: SupabaseSyncEvent): Promise<void> {
     if (this.isPushing) return; // Skip echoes from our own pushes
+    if (!this._isActiveDevice) return; // Only the active device applies remote changes
     const changeId = payload.new?.id || payload.old?.id;
     if (changeId && this.recentlyPushedIds.has(changeId)) return; // Skip async echoes
     try {
@@ -794,6 +883,7 @@ export class SupabaseSyncClient {
    */
   private async handleTabChange(payload: SupabaseSyncEvent): Promise<void> {
     if (this.isPushing) return; // Skip echoes from our own pushes
+    if (!this._isActiveDevice) return; // Only the active device applies remote changes
     const changeId = payload.new?.id || payload.old?.id;
     if (changeId && this.recentlyPushedIds.has(changeId)) return; // Skip async echoes
     try {
