@@ -291,19 +291,35 @@ export class SupabaseSyncClient {
     }
 
     if (data.device_id === this.deviceId) {
-      // We are the active device
+      // This device is recorded as active. Re-claim and continue.
       this._isActiveDevice = true;
       this.startHeartbeat();
       this.onActiveDeviceChange?.(true);
     } else {
-      // Another device is active. Don't auto-claim — the user should
-      // explicitly choose "Resume Working Here" so the materialization
-      // flow can pull from the cloud and set up the browser correctly.
-      // Auto-claiming from a second browser was the root cause of the
-      // April 15 cross-browser corruption (Firefox stole the claim on
-      // load, then Chrome saw the modal and couldn't get past it).
-      this._isActiveDevice = false;
-      this.onActiveDeviceChange?.(false, data.device_name);
+      // Another device is active. Check if it's stale.
+      const lastBeat = new Date(data.last_heartbeat).getTime();
+      const staleThreshold = 2 * 60 * 1000; // 2 minutes
+
+      if (Date.now() - lastBeat > staleThreshold) {
+        // Stale heartbeat. Auto-claim only if this device has local
+        // workspaces (established install coming back online). A fresh
+        // second browser with no local data must go through "Resume
+        // Working Here" to pull from the cloud first.
+        const localWorkspaces = await this.storage.getWorkspaces(this.localUserId);
+        if (localWorkspaces.length > 0) {
+          console.log('[TabFlow] Active device is stale and we have local workspaces — auto-claiming');
+          await this.claimActiveDevice();
+        } else {
+          console.log('[TabFlow] Active device is stale but no local workspaces — showing modal');
+          this._isActiveDevice = false;
+          this.onActiveDeviceChange?.(false, data.device_name);
+        }
+      } else {
+        // Fresh heartbeat — another device is actively working.
+        // Show the modal so the user can explicitly choose to take over.
+        this._isActiveDevice = false;
+        this.onActiveDeviceChange?.(false, data.device_name);
+      }
     }
   }
 

@@ -304,6 +304,10 @@ async function initializeSync(userId: string) {
     // If this device is the active device, do a full sync push to clean up
     // any orphaned cloud rows. This runs after every extension reload so the
     // cloud stays an exact mirror of local state.
+    // Run the safeToPush migration inline first — the deferred setTimeout
+    // runs 1.5s after startup, which is AFTER initializeSync, so without
+    // this the safeToPush check below always fails on first boot.
+    await maybeMigrateSafeToPush();
     if (syncClient.isActiveDevice && (await isSafeToPush())) {
       try {
         syncClient.setPushing(true);
