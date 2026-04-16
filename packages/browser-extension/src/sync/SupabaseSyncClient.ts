@@ -296,16 +296,14 @@ export class SupabaseSyncClient {
       this.startHeartbeat();
       this.onActiveDeviceChange?.(true);
     } else {
-      // Another device is active — check if it's stale (no heartbeat in 2 minutes)
-      const lastBeat = new Date(data.last_heartbeat).getTime();
-      const staleThreshold = 2 * 60 * 1000; // 2 minutes
-      if (Date.now() - lastBeat > staleThreshold) {
-        console.log('[TabFlow] Active device is stale, auto-claiming');
-        await this.claimActiveDevice();
-      } else {
-        this._isActiveDevice = false;
-        this.onActiveDeviceChange?.(false, data.device_name);
-      }
+      // Another device is active. Don't auto-claim — the user should
+      // explicitly choose "Resume Working Here" so the materialization
+      // flow can pull from the cloud and set up the browser correctly.
+      // Auto-claiming from a second browser was the root cause of the
+      // April 15 cross-browser corruption (Firefox stole the claim on
+      // load, then Chrome saw the modal and couldn't get past it).
+      this._isActiveDevice = false;
+      this.onActiveDeviceChange?.(false, data.device_name);
     }
   }
 

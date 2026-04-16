@@ -627,37 +627,6 @@ export const styles: Record<string, React.CSSProperties> = {
     margin: '0 0 18px 0',
   } as React.CSSProperties,
 
-  resumeModalChoices: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '10px',
-    marginBottom: '18px',
-  } as React.CSSProperties,
-
-  resumeModalChoice: {
-    display: 'flex',
-    gap: '12px',
-    padding: '12px',
-    border: '1px solid #2d3142',
-    borderRadius: '8px',
-    cursor: 'pointer',
-    alignItems: 'flex-start',
-    backgroundColor: '#181b26',
-  } as React.CSSProperties,
-
-  resumeModalChoiceLabel: {
-    fontSize: '13px',
-    fontWeight: 600,
-    color: '#e2e8f0',
-    marginBottom: '4px',
-  } as React.CSSProperties,
-
-  resumeModalChoiceHint: {
-    fontSize: '12px',
-    color: '#94a3b8',
-    lineHeight: 1.45,
-  } as React.CSSProperties,
-
   resumeModalError: {
     padding: '10px 12px',
     backgroundColor: 'rgba(220, 38, 38, 0.15)',
