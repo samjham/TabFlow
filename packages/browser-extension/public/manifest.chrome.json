@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TabFlow",
-  "version": "0.1.2",
+  "version": "0.1.57",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA/Hh0APwhj5fAbFhD7xExzhTb7BW8cvvlB6WVguMuuDkBUeHwcTgBKWMkzlAIlQW1XJttYb1Ka/Pt9kBV1UKsDaf5NcljW3GAiZWEhcF067V8X9xCBSP+1WO4Ouu7ub5bA5dvi63E8viHGIRDPFIGVQ7nG8tiPsw7oSY9Wy1tefH9AjMI0rhSlzDMDLLDKzDHsR+KbNKtPFWrNUHbBgbgbr/Ts6YWL8Jy9S3AOe1EOhSHj3pKMDGCNwA7Iu/SWb/Y6ESvAqdIVy4n0EijUgn6A48sHsTDEo3RdWWK9ShUWOTrTOcxd1eONufOoLMShuiQHTcR1mNzyPYRZTTNAequhwIDAQAB",
   "description": "Organize your tabs into workspaces. Save, restore, and sync across devices.",
   "permissions": [
@@ -43,9 +43,31 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://www.youtube.com/*"],
-      "js": ["youtube-time-tracker.js"],
+      "matches": [
+        "*://www.youtube.com/*"
+      ],
+      "js": [
+        "youtube-time-tracker.js"
+      ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "scroll-tracker.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "operation-overlay.js"
+      ],
+      "run_at": "document_start"
     }
   ]
 }

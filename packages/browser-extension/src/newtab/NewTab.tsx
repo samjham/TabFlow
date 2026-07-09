@@ -8,6 +8,7 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { MessageType } from '../background/MessageHandler';
 import { useWorkspaces, SearchResult } from './useWorkspaces';
 import type { WorkspaceHistoryEntry, DeletedWorkspace } from '@tabflow/core';
 import * as AuthManager from '../auth/AuthManager';
@@ -18,6 +19,26 @@ import { WorkspaceSidebarItem } from './WorkspaceSidebarItem';
 import { TabCard } from './TabCard';
 import { HistoryPanel } from './HistoryPanel';
 import { ArchivePanel } from './ArchivePanel';
+import { isFirefox } from '../browser-compat';
+
+interface DiagnosticEntry {
+  ts: number;
+  category: string;
+  message: string;
+  data?: string;
+}
+
+/**
+ * TabFlow version pulled from the manifest at module load.
+ * Rendered in the top-right header alongside memory stats.
+ */
+const TABFLOW_VERSION = chrome.runtime.getManifest().version;
+
+/**
+ * Display label for the current browser. Used in the memory line so it
+ * reads "Chrome X/Y" or "Firefox X/Y" depending on the build target.
+ */
+const BROWSER_LABEL = isFirefox ? 'Firefox' : 'Chrome';
 
 interface NewTabProps {
   user?: { id: string; email: string } | null;
@@ -27,6 +48,99 @@ interface NewTabProps {
 export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
   const { workspaces, activeWorkspace, tabs, loading, error, createWorkspace, deleteWorkspace, switchWorkspace, renameWorkspace, changeWorkspaceColor, changeShortName, reorderWorkspaces, removeTab, removeTabs, moveTabs, duplicateTabs, closeAllTabs, getWorkspaceHistory, restoreHistoryEntry, searchAllWorkspaces, reorderTabs, getDeletedWorkspaces, restoreDeletedWorkspaces, permanentlyDeleteWorkspaces } = useWorkspaces();
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Persisted, user-controlled sidebar width (defaults to SIDEBAR_WIDTH).
+  // The drag handle on the right edge updates this and writes it to
+  // chrome.storage.local so it survives across sessions. A future change
+  // will mirror this through user_settings.preferences so the value also
+  // syncs across devices.
+  const [sidebarWidth, setSidebarWidth] = useState<number>(SIDEBAR_WIDTH);
+  // True while the user is mid-drag on the resize handle — disables CSS
+  // transitions so width changes track the cursor instantly.
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+  // True when an item in the sidebar reports its label is currently being
+  // clamped and wants the sidebar widened to reveal it. Only the truncated
+  // hover triggers this — see WorkspaceSidebarItem onWantsHoverExpand.
+  const [hoverExpandActive, setHoverExpandActive] = useState(false);
+
+  // 0.1.57: Pre-switch prompt modal state. When the user clicks a
+  // workspace to switch, we first query the SW for tabs to prompt about
+  // (audible OR previously-preserved). If any, this state is populated
+  // and the modal renders; user's checkbox selections drive preserveIds
+  // in the final SWITCH_WORKSPACE payload.
+  const [preSwitchModal, setPreSwitchModal] = useState<{
+    targetWorkspaceId: string;
+    tabs: Array<{
+      storageId: string;
+      url: string;
+      title: string;
+      faviconUrl?: string;
+      audible: boolean;
+      persistent: boolean;
+    }>;
+    checked: Set<string>;
+  } | null>(null);
+
+  const handleSidebarSwitchClick = React.useCallback(async (targetId: string) => {
+    try {
+      const resp = await new Promise<any>((resolve) => {
+        chrome.runtime.sendMessage(
+          { type: MessageType.GET_TABS_TO_PROMPT_FOR_SWITCH },
+          (r) => resolve(r)
+        );
+      });
+      const tabs = resp?.data?.tabs || [];
+      if (tabs.length === 0) {
+        // No audible / no preserved — switch immediately with empty
+        // preserveIds so backend knows we made a "no preservation" decision.
+        await switchWorkspace(targetId, []);
+        return;
+      }
+      // Pre-check tabs that were previously flagged as persistent. Audible-
+      // but-not-yet-persistent tabs start unchecked so the user has to opt
+      // in for those (matches the "forces you to remember" ask).
+      const initialChecked = new Set<string>(
+        tabs.filter((t: any) => t.persistent).map((t: any) => t.storageId)
+      );
+      setPreSwitchModal({
+        targetWorkspaceId: targetId,
+        tabs,
+        checked: initialChecked,
+      });
+    } catch (err) {
+      console.warn('[TabFlow] GET_TABS_TO_PROMPT_FOR_SWITCH failed, switching anyway:', err);
+      await switchWorkspace(targetId);
+    }
+  }, [switchWorkspace]);
+
+  const handlePreSwitchModalContinue = React.useCallback(async () => {
+    if (!preSwitchModal) return;
+    const { targetWorkspaceId, checked } = preSwitchModal;
+    setPreSwitchModal(null);
+    try {
+      await switchWorkspace(targetWorkspaceId, Array.from(checked));
+    } catch (err) {
+      console.warn('[TabFlow] switchWorkspace with preserveIds failed:', err);
+    }
+  }, [preSwitchModal, switchWorkspace]);
+
+  const handlePreSwitchModalCancel = React.useCallback(() => {
+    setPreSwitchModal(null);
+  }, []);
+  // Ref for the debounced collapse timer. When the cursor leaves a workspace
+  // item, we schedule a collapse 200ms later. If another item's hover
+  // re-fires within that window (e.g. because the CSS transition caused a
+  // phantom mouseleave/mouseenter pair as items reflowed), we cancel the
+  // pending collapse and stay expanded. Without this, the sidebar bounces
+  // between expanded and collapsed for a few hundred ms whenever expand
+  // first fires.
+  const hoverCollapseTimerRef = useRef<number | null>(null);
+  /** Width the sidebar expands to on truncated-name hover. */
+  const HOVER_EXPAND_WIDTH = 380;
+  /** Min and max bounds the user can drag to. */
+  const SIDEBAR_MIN_WIDTH = 180;
+  const SIDEBAR_MAX_WIDTH = 400;
+  /** chrome.storage.local key for the persisted sidebar width. */
+  const SIDEBAR_WIDTH_STORAGE_KEY = 'tabflow_sidebar_width';
   const [showNewWorkspaceForm, setShowNewWorkspaceForm] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
   const [newWorkspaceColor, setNewWorkspaceColor] = useState(COLOR_PALETTE[0]);
@@ -79,16 +193,147 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
   const [archiveLoading, setArchiveLoading] = useState(false);
 
   // ─── Multi-device sync: "Resume Working Here" ───
-  const [isActiveDevice, setIsActiveDevice] = useState(true);
+  const [isActiveDevice, setIsActiveDevice] = useState<'unknown' | 'active' | 'inactive'>('unknown');
+  const [pollHasReturned, setPollHasReturned] = useState(false);
   const [inactiveClaimedBy, setInactiveClaimedBy] = useState<string | null>(null);
   const [claimInProgress, setClaimInProgress] = useState(false);
   const [claimError, setClaimError] = useState<string | null>(null);
+  // 0.1.51: 4-second grace period after mount. If sync init confirms
+  // 'active' within that window, the Resume modal never appears (avoids
+  // flashing the modal on every SW restart while polling races init).
+  const [mountedAt] = useState<number>(() => Date.now());
+  const [graceExpired, setGraceExpired] = useState(false);
+
+  // ─── Phase 3: floating loading overlay during system operations ───
+  // Polled from the SystemOperationGate via GET_OPERATION_STATUS every 300ms.
+  // When non-null, a small banner with a spinner appears at the top of the
+  // page. The banner is pointer-events:none and doesn't block input or
+  // media playback — purely informational.
+  const [currentOperation, setCurrentOperation] = useState<{ name: string; startedAt: number } | null>(null);
+
+  // 0.1.44: In-app diagnostic log viewer (Ctrl+Shift+D).
+  const [debugPanelOpen, setDebugPanelOpen] = useState(false);
+  const [diagnosticEntries, setDiagnosticEntries] = useState<DiagnosticEntry[]>([]);
+
+  // 0.1.45: One-click Diagnose button state.
+  const [diagnoseToast, setDiagnoseToast] = useState<string | null>(null);
+  const [diagnoseBusy, setDiagnoseBusy] = useState(false);
+  const [diagnoseFallbackReport, setDiagnoseFallbackReport] = useState<string | null>(null);
+  const [diagnoseButtonHover, setDiagnoseButtonHover] = useState(false);
 
   // ─── Passphrase mismatch safeguard ───
   // Set when the background service worker detected that the local passphrase
   // can't decrypt the cloud canary. Sync is halted until the user re-signs in
   // with the correct passphrase.
   const [passphraseMismatch, setPassphraseMismatch] = useState<string | null>(null);
+
+  // 0.1.50: schema-cache-missing-column banner. When SupabaseSyncClient
+  // hits a PostgREST error like "Could not find the 'X' column of 'tabs'
+  // in the schema cache" (typically because the user hasn't re-run
+  // tabflow-setup.sql after an upgrade that added a column), the SW
+  // records the column name in chrome.storage.local. We poll every 5s
+  // and show a prominent yellow banner with the exact ALTER TABLE SQL.
+  const [schemaMissingColumn, setSchemaMissingColumn] = useState<
+    { column: string; operation: string; detectedAt: number } | null
+  >(null);
+  const [schemaSqlCopied, setSchemaSqlCopied] = useState(false);
+  const [schemaBannerDismissed, setSchemaBannerDismissed] = useState(false);
+
+  // 0.1.50: read the schema-cache flag on mount + poll every 5s.
+  useEffect(() => {
+    let cancelled = false;
+    const check = () => {
+      try {
+        chrome.storage.local.get('tabflow_schema_missing_column', (result) => {
+          if (cancelled) return;
+          const flag = result?.tabflow_schema_missing_column;
+          if (flag && typeof flag.column === 'string') {
+            setSchemaMissingColumn({
+              column: flag.column,
+              operation: flag.operation || 'unknown',
+              detectedAt: flag.detectedAt || 0,
+            });
+          } else {
+            setSchemaMissingColumn(null);
+            // Reset the session-dismiss when the flag is cleared so a
+            // fresh occurrence re-shows the banner.
+            setSchemaBannerDismissed(false);
+          }
+        });
+      } catch {
+        // ignore
+      }
+    };
+    check();
+    const id = setInterval(check, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  // 0.1.44: Ctrl+Shift+D toggles the diagnostic log panel.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
+        e.preventDefault();
+        setDebugPanelOpen((v) => !v);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
+  // 0.1.44: Poll GET_DIAGNOSTIC_LOG every 2s while the debug panel is open.
+  useEffect(() => {
+    if (!debugPanelOpen) return;
+    const fetchLog = () => {
+      chrome.runtime.sendMessage({ type: 'GET_DIAGNOSTIC_LOG' }, (response) => {
+        if (chrome.runtime.lastError) return;
+        if (response?.success && Array.isArray(response.data)) {
+          setDiagnosticEntries(response.data as DiagnosticEntry[]);
+        }
+      });
+    };
+    fetchLog();
+    const timer = setInterval(fetchLog, 2000);
+    return () => clearInterval(timer);
+  }, [debugPanelOpen])
+
+  // 0.1.45: Auto-dismiss the Copied toast after 2s.
+  useEffect(() => {
+    if (!diagnoseToast) return;
+    const t = setTimeout(() => setDiagnoseToast(null), 2000);
+    return () => clearTimeout(t);
+  }, [diagnoseToast]);
+
+  // 0.1.45: Diagnose button handler. Sends GET_DIAGNOSTIC_REPORT to the
+  // service worker, copies the returned text to clipboard, shows a toast.
+  // On any failure, falls back to a modal textarea the user can copy from.
+  const handleDiagnose = () => {
+    if (diagnoseBusy) return;
+    setDiagnoseBusy(true);
+    chrome.runtime.sendMessage({ type: 'GET_DIAGNOSTIC_REPORT' }, async (response) => {
+      setDiagnoseBusy(false);
+      if (chrome.runtime.lastError) {
+        console.warn('[TabFlow] Diagnose message failed:', chrome.runtime.lastError.message);
+        setDiagnoseToast('Failed to gather report - see console');
+        return;
+      }
+      const report = response?.data?.report as string | undefined;
+      if (!response?.success || typeof report !== 'string') {
+        setDiagnoseToast('Failed to gather report - see console');
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(report);
+        setDiagnoseToast('Copied diagnostic report to clipboard');
+      } catch (err) {
+        console.warn('[TabFlow] Clipboard write failed, showing fallback modal:', err);
+        setDiagnoseFallbackReport(report);
+      }
+    });
+  };
 
   // ─── Drag-and-drop tab reordering state ───
   const [localTabs, setLocalTabs] = useState<Tab[]>([]);
@@ -103,6 +348,120 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
   const gridRef = useRef<HTMLDivElement>(null);
   const localTabsRef = useRef<Tab[]>([]);
 
+  // Load persisted sidebar width on mount.
+  useEffect(() => {
+    chrome.storage.local.get(SIDEBAR_WIDTH_STORAGE_KEY).then((stored) => {
+      const w = stored[SIDEBAR_WIDTH_STORAGE_KEY];
+      if (typeof w === 'number' && w >= SIDEBAR_MIN_WIDTH && w <= SIDEBAR_MAX_WIDTH) {
+        setSidebarWidth(w);
+      }
+    }).catch(() => { /* storage unavailable — keep default */ });
+    // Disable lint: SIDEBAR_* constants are stable per render and we only
+    // want to load once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ─── Phase 3: inject @keyframes for the operation-overlay spinner ───
+  // styles.ts CSSProperties can't define keyframes (those are top-level CSS
+  // rules), so we inject a tiny <style> tag once on mount and clean it up
+  // on unmount. No-op if React strict-mode double-mounts in dev (the second
+  // mount finds the existing rule, browsers tolerate duplicate keyframes).
+  useEffect(() => {
+    const style = document.createElement('style');
+    style.setAttribute('data-tabflow-overlay', 'spinner');
+    style.textContent = '@keyframes tabflow-spin { to { transform: rotate(360deg); } }';
+    document.head.appendChild(style);
+    return () => {
+      if (style.parentNode) style.parentNode.removeChild(style);
+    };
+  }, []);
+
+  // ─── Phase 3: poll GET_OPERATION_STATUS every 300ms ───
+  // Drives the floating loading overlay. The SystemOperationGate is set
+  // for all five system operations (workspace switch, history restore,
+  // claim materialization, move tabs, Chrome-restart flow); when active
+  // the overlay surfaces a friendly label so the user knows something
+  // is happening. 300ms is responsive enough that the overlay appears
+  // within a frame of the click, and infrequent enough not to add SW
+  // latency.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | null = null;
+    const POLL_MS = 300;
+    const poll = () => {
+      try {
+        chrome.runtime.sendMessage({ type: 'GET_OPERATION_STATUS' }, (response) => {
+          if (cancelled) return;
+          if (chrome.runtime.lastError) {
+            // SW is restarting / not ready — try again next tick.
+            timer = window.setTimeout(poll, POLL_MS);
+            return;
+          }
+          if (response?.success) {
+            const state = response.data as { operationName: string; startedAt: number } | null;
+            if (state) {
+              setCurrentOperation((prev) => {
+                if (prev && prev.name === state.operationName && prev.startedAt === state.startedAt) {
+                  return prev;
+                }
+                return { name: state.operationName, startedAt: state.startedAt };
+              });
+            } else {
+              setCurrentOperation((prev) => (prev === null ? prev : null));
+            }
+          }
+          if (!cancelled) timer = window.setTimeout(poll, POLL_MS);
+        });
+      } catch {
+        if (!cancelled) timer = window.setTimeout(poll, POLL_MS);
+      }
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, []);
+
+
+  // Resize drag — wire global mousemove/mouseup while dragging the
+  // sidebar's right-edge handle. Window-level so the drag continues
+  // even when the cursor leaves the sidebar's pixel area.
+  useEffect(() => {
+    if (!isResizingSidebar) return;
+    const handleMove = (e: MouseEvent) => {
+      const clamped = Math.max(
+        SIDEBAR_MIN_WIDTH,
+        Math.min(SIDEBAR_MAX_WIDTH, e.clientX)
+      );
+      setSidebarWidth(clamped);
+    };
+    const handleUp = () => {
+      setIsResizingSidebar(false);
+    };
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isResizingSidebar]);
+
+  // Persist the user-chosen sidebar width to chrome.storage.local
+  // whenever the drag finishes (i.e. when isResizingSidebar flips false).
+  useEffect(() => {
+    if (isResizingSidebar) return;
+    chrome.storage.local.set({ [SIDEBAR_WIDTH_STORAGE_KEY]: sidebarWidth })
+      .catch(() => { /* storage unavailable — non-fatal */ });
+    // Also push to the service worker so the value mirrors to the cloud
+    // and reaches the user's other devices on their next claim/pull.
+    try {
+      chrome.runtime.sendMessage({ type: 'SAVE_SIDEBAR_WIDTH', payload: { width: sidebarWidth } });
+    } catch { /* SW unreachable — non-fatal */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isResizingSidebar, sidebarWidth]);
+
   // Clear selection when switching workspaces
   useEffect(() => {
     setSelectedTabIds(new Set());
@@ -112,15 +471,22 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
     setShowDuplicatePopup(false);
   }, [activeWorkspace?.id]);
 
-  // Fetch thumbnails for current workspace tabs
+  // Fetch thumbnails for current workspace tabs.
+  //
+  // 0.1.31: poll FAST (every 1s) for the first 30s after the active
+  // workspace changes, then settle to every 5s. The fast phase catches
+  // newly-captured thumbnails from the bulk backfill pass that runs
+  // ~1s after a switch — they would otherwise take up to 5s to appear.
+  // The slow phase covers steady-state usage (user clicks a tab, a
+  // single capture happens, refresh within 5s).
   useEffect(() => {
     if (!tabs || tabs.length === 0) return;
-    const urls = tabs.map((t) => t.url).filter(Boolean);
-    if (urls.length === 0) return;
+    const tabIds = tabs.map((t) => t.id).filter(Boolean);
+    if (tabIds.length === 0) return;
 
     const fetchThumbnails = () => {
       chrome.runtime.sendMessage(
-        { type: 'GET_THUMBNAILS', payload: { urls } },
+        { type: 'GET_THUMBNAILS', payload: { tabIds } },
         (response) => {
           if (response?.success && response.data) {
             setThumbnails((prev) => ({ ...prev, ...response.data }));
@@ -132,11 +498,29 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
     // Fetch immediately
     fetchThumbnails();
 
-    // Poll for new thumbnails periodically — thumbnails are captured lazily
-    // as you visit tabs, so this picks up newly captured ones.
-    const pollInterval = setInterval(fetchThumbnails, 5000);
-    return () => clearInterval(pollInterval);
-  }, [tabs]);
+    // Fast polling for the first 30s after this workspace becomes
+    // active (catches backfill captures), then slow polling after.
+    const fastStart = Date.now();
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const schedule = () => {
+      if (cancelled) return;
+      const elapsed = Date.now() - fastStart;
+      const delay = elapsed < 30000 ? 1000 : 5000;
+      timer = setTimeout(() => {
+        if (cancelled) return;
+        fetchThumbnails();
+        schedule();
+      }, delay);
+    };
+    schedule();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [tabs, activeWorkspace?.id]);
 
   // ─── Fetch workspace stats (memory, audible) ───
   useEffect(() => {
@@ -162,14 +546,49 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
     return () => clearInterval(statsInterval);
   }, [workspaces.length]);
 
-  // ─── Multi-device status: check on mount + listen for changes ───
+  // ─── Multi-device status: recurring poll + listen for passphrase mismatch ───
   useEffect(() => {
-    // Initial check
-    chrome.runtime.sendMessage({ type: 'GET_DEVICE_STATUS' }, (response) => {
-      if (response?.success && response.data) {
-        setIsActiveDevice(response.data.isActive);
+    let timer: number | null = null;
+    let cancelled = false;
+
+    const POLL_INTERVAL_MS = 3000;
+
+    const poll = () => {
+      chrome.runtime.sendMessage({ type: 'GET_DEVICE_STATUS' }, (response) => {
+        if (cancelled) return;
+        if (response?.success && response.data) {
+          setIsActiveDevice(response.data.isActive ? 'active' : 'inactive');
+          setInactiveClaimedBy(response.data.claimedBy || null);
+          setPollHasReturned(true);
+        }
+        // Schedule next poll regardless of success — the SW may be cold
+        // starting on this call and respond properly on the next one.
+        if (!cancelled) {
+          timer = window.setTimeout(poll, POLL_INTERVAL_MS);
+        }
+      });
+    };
+
+    // Kick off the first poll immediately.
+    poll();
+
+    // Also poll immediately whenever the tab becomes visible again, so a
+    // user returning to a PC after hours/days away gets fresh status within
+    // milliseconds instead of waiting up to POLL_INTERVAL_MS. This is the
+    // key fix for the "I sat down at PC2 after the weekend and the Resume
+    // Working Here modal didn't show" symptom — Firefox suspends idle tab
+    // timers, so on focus we force a fresh check.
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        if (timer !== null) {
+          window.clearTimeout(timer);
+          timer = null;
+        }
+        poll();
       }
-    });
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
 
     // Check initial passphrase-mismatch state (may have been set before this
     // page loaded).
@@ -179,27 +598,73 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
       }
     }).catch(() => {});
 
-    // Listen for device status + passphrase-mismatch changes via storage.session
+    // Listen for passphrase-mismatch state changes via storage.session.
+    // (The old `deviceStatus` broadcast was removed in the 2026-04-20
+    // DB-only refactor and is no longer written by the service worker;
+    // polling above replaces it. We keep passphraseMismatch listening
+    // because that IS still broadcast via storage.session.)
     const listener = (
       changes: { [key: string]: chrome.storage.StorageChange },
       areaName: string
     ) => {
       if (areaName !== 'session') return;
-      if (changes.deviceStatus) {
-        const status = changes.deviceStatus.newValue;
-        if (status) {
-          setIsActiveDevice(status.isActive);
-          setInactiveClaimedBy(status.claimedBy || null);
-        }
-      }
       if (changes.passphraseMismatch) {
         const mismatch = changes.passphraseMismatch.newValue;
         setPassphraseMismatch(mismatch?.message || null);
       }
     };
     chrome.storage.onChanged.addListener(listener);
-    return () => chrome.storage.onChanged.removeListener(listener);
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+      chrome.storage.onChanged.removeListener(listener);
+    };
   }, []);
+
+  // Safety: if the polling hasn't returned a definitive answer in 5s,
+  // show the modal anyway. Better to ask the user to act than to silently
+  // leave them in a half-initialized state where enforceTabLock still
+  // fires but the modal never appeared.
+  useEffect(() => {
+    const safetyTimer = window.setTimeout(() => {
+      setIsActiveDevice((prev) => (prev === 'unknown' ? 'inactive' : prev));
+    }, 5000);
+    return () => window.clearTimeout(safetyTimer);
+  }, []);
+
+  // 0.1.39: clear any stale claim error when the device transitions to
+  // active. Covers two cases:
+  //   (1) The user's first Resume click hit the "Sync not initialized"
+  //       race and set an error; their second click succeeded but the
+  //       success path only clears claimError in the response callback,
+  //       not via a side-channel like realtime/polling.
+  //   (2) A different mechanism (e.g. another tab in the same browser
+  //       successfully claimed) flips isActiveDevice to 'active' while
+  //       this tab's modal still has a stale error.
+  useEffect(() => {
+    if (isActiveDevice === 'active') {
+      setClaimError(null);
+    }
+  }, [isActiveDevice]);
+
+  // 0.1.51: fire graceExpired after 8s if isActiveDevice is still
+  // 'unknown'. If sync confirms 'active' earlier the modal never renders;
+  // if it's still 'unknown' after 8s we surface the modal so the user
+  // isn't blocked from taking over when sync init is genuinely broken.
+  // 0.1.52: bumped from 4s to 8s to accommodate slower sync init on cold
+  // starts (Firefox in particular can take longer to complete auth).
+  useEffect(() => {
+    if (isActiveDevice === 'unknown') {
+      const timer = setTimeout(() => {
+        setGraceExpired(true);
+      }, 8000);
+      return () => clearTimeout(timer);
+    }
+    return undefined;
+  }, [isActiveDevice, mountedAt]);
 
   /** Handler for "Resume Working Here" button */
   const handleResumeHere = useCallback(() => {
@@ -210,7 +675,7 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
       (response) => {
         setClaimInProgress(false);
         if (response?.success) {
-          setIsActiveDevice(true);
+          setIsActiveDevice('active');
           setInactiveClaimedBy(null);
           setClaimError(null);
         } else {
@@ -853,9 +1318,32 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
       <div
         style={{
           ...styles.sidebar,
-          width: sidebarOpen ? SIDEBAR_WIDTH : 0,
+          width: sidebarOpen
+            ? (hoverExpandActive ? Math.max(sidebarWidth, HOVER_EXPAND_WIDTH) : sidebarWidth)
+            : 0,
           opacity: sidebarOpen ? 1 : 0,
           pointerEvents: sidebarOpen ? 'auto' : 'none',
+          transition: isResizingSidebar ? 'none' : 'all 0.2s ease-out',
+        }}
+        onMouseEnter={() => {
+          // Cancel any pending collapse — sidebar is still hovered.
+          if (hoverCollapseTimerRef.current !== null) {
+            window.clearTimeout(hoverCollapseTimerRef.current);
+            hoverCollapseTimerRef.current = null;
+          }
+        }}
+        onMouseLeave={() => {
+          // Cursor left the entire sidebar — collapse after a small
+          // debounce to absorb CSS-transition phantom events. This is
+          // the only place hover-expand collapse fires from. Item-level
+          // mouseleave no longer collapses; see onWantsHoverCollapse above.
+          if (hoverCollapseTimerRef.current !== null) {
+            window.clearTimeout(hoverCollapseTimerRef.current);
+          }
+          hoverCollapseTimerRef.current = window.setTimeout(() => {
+            setHoverExpandActive(false);
+            hoverCollapseTimerRef.current = null;
+          }, 100);
         }}
       >
         {/* Header */}
@@ -901,6 +1389,7 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                 dragOverPosition={dragOverPosition}
                 dragIndicatorColor={workspaces.find((w) => w.id === draggedWorkspaceId)?.color ?? '#6c8cff'}
                 isBeingDragged={draggedWorkspaceId === ws.id}
+                disabled={currentOperation !== null}
                 onClick={() => switchWorkspace(ws.id)}
                 onDelete={() => handleDeleteWorkspace(ws.id)}
                 onRename={(name) => renameWorkspace(ws.id, name)}
@@ -911,6 +1400,20 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                 onDrop={(e) => handleDrop(ws.id, e)}
                 onDragEnd={handleDragEnd}
                 stats={workspaceStats[ws.id]}
+                onWantsHoverExpand={() => {
+                  if (hoverCollapseTimerRef.current !== null) {
+                    window.clearTimeout(hoverCollapseTimerRef.current);
+                    hoverCollapseTimerRef.current = null;
+                  }
+                  setHoverExpandActive(true);
+                }}
+                onWantsHoverCollapse={() => {
+                  // No-op: item-level mouseleave used to collapse, but that
+                  // caused a bounce loop when expand reflowed the name and
+                  // the cursor ended up in empty space outside the item.
+                  // Collapse is now triggered at the sidebar level — see
+                  // the sidebar div's onMouseLeave handler below.
+                }}
               />
             ))}
           </div>
@@ -1003,13 +1506,33 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
       <button
         style={{
           ...styles.toggleButton,
-          left: sidebarOpen ? SIDEBAR_WIDTH - 12 : 0,
+          left: sidebarOpen ? (hoverExpandActive ? Math.max(sidebarWidth, HOVER_EXPAND_WIDTH) : sidebarWidth) - 12 : 0,
         }}
         onClick={() => setSidebarOpen(!sidebarOpen)}
         title={sidebarOpen ? 'Collapse' : 'Expand'}
       >
         {sidebarOpen ? '‹' : '›'}
       </button>
+
+      {/* Sidebar drag-resize handle. Thin vertical strip sitting on the
+          sidebar's right edge — cursor changes to ew-resize, mousedown
+          starts the drag (handled globally via the useEffect above). */}
+      {sidebarOpen && (
+        <div
+          onMouseDown={(e) => { e.preventDefault(); setIsResizingSidebar(true); }}
+          style={{
+            position: 'absolute',
+            left: (hoverExpandActive ? Math.max(sidebarWidth, HOVER_EXPAND_WIDTH) : sidebarWidth) - 2,
+            top: 0,
+            bottom: 0,
+            width: '4px',
+            cursor: 'ew-resize',
+            zIndex: 50,
+            transition: isResizingSidebar ? 'none' : 'left 0.2s ease-out',
+          }}
+          title="Drag to resize sidebar"
+        />
+      )}
 
       {/* Main Content Area */}
       <div style={styles.mainContent}>
@@ -1025,13 +1548,69 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
           </div>
         )}
 
+        {/* 0.1.50: schema-cache-missing-column banner. Fires when Supabase
+            rejects a push because a column is missing from PostgREST's
+            schema cache — typically because the user hasn't re-run the
+            tabflow-setup.sql after an upgrade that added a column.
+            Shows the exact ALTER TABLE + NOTIFY reload SQL. Not
+            dismissible-forever — the session-level dismiss clears when
+            a fresh occurrence is detected. */}
+        {schemaMissingColumn && !schemaBannerDismissed && (() => {
+          const col = schemaMissingColumn.column;
+          const knownColumn = col === 'persistent';
+          const sql = knownColumn
+            ? `ALTER TABLE public.tabs ADD COLUMN IF NOT EXISTS ${col} BOOLEAN NOT NULL DEFAULT false;\nNOTIFY pgrst, 'reload schema';`
+            : `-- Re-run packages/supabase/tabflow-setup.sql on your Supabase project.\n-- The missing column is: ${col}\n-- Check the setup SQL file for the correct column type.\nNOTIFY pgrst, 'reload schema';`;
+          return (
+            <div style={styles.schemaBanner}>
+              <div style={styles.schemaBannerContent}>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0, marginTop: 2 }}>
+                  <path d="M12 2L1 21h22L12 2zm0 4.83L19.17 19H4.83L12 6.83zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z" fill="#78350f"/>
+                </svg>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={styles.schemaBannerTitle}>
+                    Your Supabase schema is missing a column
+                    (&lsquo;{col}&rsquo;). Sync is failing.
+                  </div>
+                  <div style={styles.schemaBannerBody}>
+                    Run this SQL in your Supabase dashboard (SQL Editor):
+                  </div>
+                  <pre style={styles.schemaBannerCode}>{sql}</pre>
+                  <div style={styles.schemaBannerActions}>
+                    <button
+                      style={styles.schemaBannerBtn}
+                      onClick={() => {
+                        try {
+                          navigator.clipboard.writeText(sql);
+                          setSchemaSqlCopied(true);
+                          setTimeout(() => setSchemaSqlCopied(false), 2000);
+                        } catch {
+                          /* ignore */
+                        }
+                      }}
+                    >
+                      {schemaSqlCopied ? 'Copied!' : 'Copy SQL'}
+                    </button>
+                    <button
+                      style={styles.schemaBannerBtnSecondary}
+                      onClick={() => setSchemaBannerDismissed(true)}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
         {/* Resume Working Here modal (inactive device) — blocks interaction
             with the rest of the page until the user claims or closes the tab.
             Using a full-viewport overlay rather than a banner because the
             cross-browser-sync claim is destructive (replaces this browser's
             tabs with the active workspace's tabs) and the user needs to
             make an informed choice about what to do with the current tabs. */}
-        {!isActiveDevice && (
+        {(isActiveDevice === 'inactive' || (isActiveDevice === 'unknown' && graceExpired)) && (
           <div style={styles.resumeModalBackdrop}>
             <div style={styles.resumeModal}>
               <div style={styles.resumeModalAccent} />
@@ -1046,7 +1625,7 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                 and set up this browser to match.
               </p>
 
-              {claimError && (
+              {claimError && !claimInProgress && isActiveDevice !== 'active' && (
                 <div style={styles.resumeModalError}>{claimError}</div>
               )}
 
@@ -1057,6 +1636,138 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                   disabled={claimInProgress}
                 >
                   {claimInProgress ? 'Resuming…' : 'Resume Working Here'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 0.1.34: blocking centered modal during system operations.
+            Replaces the prior pointer-events:none top banner. The modal
+            blocks clicks because the operation is in progress — notably
+            during the thumbnail backfill that now runs inside the
+            workspace switch (so user clicks can't race tab activations).
+            YouTube videos in OTHER tabs keep playing; the modal lives on
+            the TabFlow newtab page only. Visibility is driven by
+            `currentOperation` which is polled every 300ms from the
+            SystemOperationGate. */}
+        {currentOperation && (
+          <div style={styles.operationOverlay} aria-live="polite" aria-busy="true" role="dialog" aria-modal="true">
+            <div style={styles.operationModalCard}>
+              <div style={styles.operationModalAccent} />
+              <div style={styles.operationOverlaySpinner} />
+              <h2 style={styles.operationModalTitle}>
+                {currentOperation.name === 'handleSwitchWorkspace'
+                  ? 'Switching workspace\u2026'
+                  : currentOperation.name === 'handleRestoreHistoryEntry'
+                  ? 'Restoring from history\u2026'
+                  : currentOperation.name === 'claimActiveDeviceWithMaterialization'
+                  ? 'Loading from cloud\u2026'
+                  : currentOperation.name === 'handleMoveTabsInServiceWorker'
+                  ? 'Moving tabs\u2026'
+                  : currentOperation.name === 'startupReconcile'
+                  ? 'Restoring session\u2026'
+                  : 'Working\u2026'}
+              </h2>
+              <p style={styles.operationModalSubtitle}>
+                {'Please wait \u2014 TabFlow is updating your tabs.'}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* 0.1.44: In-app diagnostic log viewer. Toggled with Ctrl+Shift+D.
+            Reads the rolling logDiagnostic() buffer from chrome.storage.local
+            every 2 seconds and displays it in a monospaced textarea for
+            copy-paste into bug reports. z-index is lower than the operation
+            overlay (10000) and Resume modal (9999) so those still block
+            interaction if they're up. */}
+        {/* 0.1.45: One-click Diagnose toast. Shown briefly after a
+            successful copy-to-clipboard. Non-blocking. */}
+        {diagnoseToast && (
+          <div style={styles.diagnoseToast} role="status" aria-live="polite">
+            {diagnoseToast}
+          </div>
+        )}
+
+        {/* 0.1.45: Clipboard-fallback modal for the Diagnose button.
+            Shown only when the report was gathered but navigator.clipboard
+            failed (e.g. permissions). The user can select-all + copy from
+            the textarea. */}
+        {diagnoseFallbackReport !== null && (
+          <div style={styles.diagnoseFallbackBackdrop} role="dialog" aria-modal="true" aria-label="Diagnostic report">
+            <div style={styles.diagnoseFallbackCard}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <strong>Diagnostic Report</strong>
+                <span style={{ fontSize: '11px', color: '#8b93a8' }}>Copy failed - select all + copy manually</span>
+              </div>
+              <textarea
+                readOnly
+                style={styles.diagnoseFallbackTextarea}
+                value={diagnoseFallbackReport}
+                onFocus={(e) => e.currentTarget.select()}
+              />
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+                <button
+                  type="button"
+                  style={styles.debugPanelButton}
+                  onClick={() => setDiagnoseFallbackReport(null)}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {debugPanelOpen && (
+          <div style={styles.debugPanelBackdrop} role="dialog" aria-modal="true" aria-label="Diagnostic log">
+            <div style={styles.debugPanelCard}>
+              <div style={styles.debugPanelHeader}>
+                <span>TabFlow Diagnostic Log ({diagnosticEntries.length} entries)</span>
+                <span style={{ fontSize: '11px', color: '#8b93a8', fontWeight: 400 }}>Ctrl+Shift+D to close</span>
+              </div>
+              <textarea
+                readOnly
+                style={styles.debugPanelTextarea}
+                value={diagnosticEntries
+                  .map((e) => {
+                    const t = new Date(e.ts).toISOString().replace('T', ' ').replace('Z', '');
+                    return e.data !== undefined
+                      ? `${t} [${e.category}] ${e.message} ${e.data}`
+                      : `${t} [${e.category}] ${e.message}`;
+                  })
+                  .join('\n')}
+              />
+              <div style={styles.debugPanelActions}>
+                <button
+                  style={styles.debugPanelButton}
+                  onClick={() => {
+                    const text = diagnosticEntries
+                      .map((e) => {
+                        const t = new Date(e.ts).toISOString().replace('T', ' ').replace('Z', '');
+                        return e.data !== undefined
+                          ? `${t} [${e.category}] ${e.message} ${e.data}`
+                          : `${t} [${e.category}] ${e.message}`;
+                      })
+                      .join('\n');
+                    navigator.clipboard.writeText(text).catch(() => {});
+                  }}
+                >
+                  Copy to Clipboard
+                </button>
+                <button
+                  style={styles.debugPanelButton}
+                  onClick={() => {
+                    chrome.runtime.sendMessage({ type: 'CLEAR_DIAGNOSTIC_LOG' }, () => {
+                      setDiagnosticEntries([]);
+                    });
+                  }}
+                >
+                  Clear Log
+                </button>
+                <button style={styles.debugPanelButton} onClick={() => setDebugPanelOpen(false)}>
+                  Close
                 </button>
               </div>
             </div>
@@ -1142,14 +1853,30 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
 
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
               <span style={styles.tabCount}>{tabs.length} tabs</span>
-              {systemMemory.total > 0 && (
-                <div style={styles.memoryBlock}>
+              <div style={styles.memoryBlock}>
+                {systemMemory.total > 0 && (
                   <span style={styles.memoryLine}>System {formatBytes(systemMemory.total - systemMemory.available)}/{formatBytes(systemMemory.total)}</span>
-                  {chromeMemory > 0 && (
-                    <span style={styles.memoryLine}>Chrome {formatBytes(chromeMemory)}/{formatBytes(systemMemory.total - systemMemory.available)}</span>
-                  )}
-                </div>
-              )}
+                )}
+                {chromeMemory > 0 && systemMemory.total > 0 && (
+                  <span style={styles.memoryLine}>{BROWSER_LABEL} {formatBytes(chromeMemory)}/{formatBytes(systemMemory.total - systemMemory.available)}</span>
+                )}
+                <span style={styles.memoryLine}>TabFlow v{TABFLOW_VERSION}</span>
+              </div>
+              <button
+                type="button"
+                title="Copy a diagnostic report to the clipboard for bug reports"
+                onClick={handleDiagnose}
+                onMouseEnter={() => setDiagnoseButtonHover(true)}
+                onMouseLeave={() => setDiagnoseButtonHover(false)}
+                disabled={diagnoseBusy}
+                style={{
+                  ...styles.diagnoseButton,
+                  ...(diagnoseButtonHover ? styles.diagnoseButtonHover : {}),
+                  ...(diagnoseBusy ? { opacity: 0.6, cursor: 'progress' } : {}),
+                }}
+              >
+                {diagnoseBusy ? 'Gathering...' : 'Diagnose'}
+              </button>
               <button
                 data-history-toggle
                 title="Workspace history"
@@ -1448,7 +2175,7 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                       tab={tab}
                       accentColor={activeWorkspace?.color || '#6c8cff'}
                       selected={selectedTabIds.has(tab.id)}
-                      thumbnailUrl={thumbnails[tab.url]}
+                      thumbnailUrl={thumbnails[tab.id]}
                       onToggleSelect={() => toggleTabSelection(tab.id)}
                       onClick={() => { if (!didDragRef.current) handleOpenTab(tab); }}
                       onRemove={() => handleRemoveTab(tab.id)}
@@ -1479,6 +2206,7 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                       boxShadow: [
                         `0 0 15px 0px ${dragAccent}80`,
                         `0 0 35px 0px ${dragAccent}4d`,
+                        `0 0 35px 0px ${dragAccent}4d`,
                         `0 0 70px 0px ${dragAccent}26`,
                         '0 10px 30px 0px rgba(0, 0, 0, 0.4)',
                       ].join(', '),
@@ -1489,7 +2217,7 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
                       tab={draggedTab}
                       accentColor={activeWorkspace?.color || '#6c8cff'}
                       selected={selectedTabIds.has(draggedTab.id)}
-                      thumbnailUrl={thumbnails[draggedTab.url]}
+                      thumbnailUrl={thumbnails[draggedTab.id]}
                       onToggleSelect={() => {}}
                       onClick={() => {}}
                       onRemove={() => {}}
@@ -1501,6 +2229,151 @@ export const NewTab: React.FC<NewTabProps> = ({ user, onSignOut }) => {
           )}
         </div>
       </div>
+
+      {/* 0.1.57: Pre-switch prompt modal — appears when the user clicks a
+          workspace to switch AND the current workspace has audible or
+          previously-preserved tabs. Replaces the pushpin as the sole
+          "keep alive across switch" mechanism. */}
+      {preSwitchModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(5, 8, 16, 0.72)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 9998,
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) handlePreSwitchModalCancel(); }}
+        >
+          <div
+            style={{
+              width: '520px',
+              maxWidth: '92vw',
+              maxHeight: '80vh',
+              background: '#1b1f28',
+              border: '1px solid rgba(255,255,255,0.08)',
+              borderTop: '3px solid #6c8cff',
+              borderRadius: '10px',
+              padding: '22px 26px',
+              boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+              color: '#e6e8ec',
+              display: 'flex',
+              flexDirection: 'column',
+            }}
+          >
+            <div style={{ fontSize: '17px', fontWeight: 600, marginBottom: '6px' }}>
+              Keep tabs playing?
+            </div>
+            <div style={{ fontSize: '13px', color: '#a3a8b3', marginBottom: '14px', lineHeight: 1.45 }}>
+              The current workspace has {preSwitchModal.tabs.length === 1 ? 'a tab' : 'tabs'} playing audio
+              or marked to stay active. Check the ones you want to keep alive across the switch.
+              Unchecked tabs will be closed.
+            </div>
+            <div style={{ overflowY: 'auto', flex: '1 1 auto', marginBottom: '16px', paddingRight: '4px' }}>
+              {preSwitchModal.tabs.map((t) => {
+                const isChecked = preSwitchModal.checked.has(t.storageId);
+                return (
+                  <label
+                    key={t.storageId}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '10px',
+                      padding: '8px 6px',
+                      borderRadius: '6px',
+                      cursor: 'pointer',
+                      background: isChecked ? 'rgba(108,140,255,0.08)' : 'transparent',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={isChecked}
+                      onChange={() => {
+                        setPreSwitchModal((prev) => {
+                          if (!prev) return prev;
+                          const next = new Set(prev.checked);
+                          if (next.has(t.storageId)) next.delete(t.storageId);
+                          else next.add(t.storageId);
+                          return { ...prev, checked: next };
+                        });
+                      }}
+                      style={{ width: '18px', height: '18px', accentColor: '#6c8cff', flexShrink: 0 }}
+                    />
+                    {t.faviconUrl ? (
+                      <img
+                        src={t.faviconUrl}
+                        alt=""
+                        style={{ width: '16px', height: '16px', flexShrink: 0 }}
+                        onError={(e) => { (e.currentTarget as HTMLImageElement).style.visibility = 'hidden'; }}
+                      />
+                    ) : (
+                      <div style={{ width: '16px', height: '16px', flexShrink: 0 }} />
+                    )}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{
+                        fontSize: '13px',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}>
+                        {t.title}
+                      </div>
+                      <div style={{
+                        fontSize: '11px',
+                        color: '#7a808a',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}>
+                        {t.audible && <span style={{ color: '#7ab88f' }}>♪ playing · </span>}
+                        {t.persistent && !t.audible && <span style={{ color: '#c8a55b' }}>previously kept · </span>}
+                        {t.url}
+                      </div>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+              <button
+                type="button"
+                onClick={handlePreSwitchModalCancel}
+                style={{
+                  padding: '9px 18px',
+                  fontSize: '13px',
+                  background: 'transparent',
+                  color: '#c0c4d0',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handlePreSwitchModalContinue}
+                style={{
+                  padding: '9px 22px',
+                  fontSize: '13px',
+                  background: '#6c8cff',
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                }}
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 };

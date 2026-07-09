@@ -12,9 +12,11 @@
  */
 
 import { Tab } from '@tabflow/core';
+import { isFirefox, isUrlOpenable, crossBrowserOnlyLabel } from '../browser-compat';
 import { NativeHostClient } from './NativeHostClient';
 import { getExtensionBaseUrl } from '../browser-compat';
 import { canonicalizeUrl, computeTabId } from '../utils/tabId';
+import { logDiagnostic } from './DiagnosticLog';
 
 /** URLs that should never be saved as workspace tabs */
 const EXCLUDED_URL_PREFIXES = [
@@ -38,6 +40,16 @@ export class TabManager {
    */
   private cachedTabFlowTabId: number | undefined = undefined;
 
+  /**
+   * Maps Chrome's numeric tab ID -> deterministic storage ID (tab-<16hex>)
+   * for tabs in the active workspace. Refreshed as a byproduct of
+   * `saveCurrentTabsToWorkspace`. Used by thumbnail capture and bulk
+   * backfill so we don't have to redo position-among-same-URL matching
+   * at capture time (which silently failed when multiple tabs shared a
+   * URL). 0.1.31
+   */
+  private chromeTabToStorageId: Map<number, string> = new Map();
+
   constructor() {
     this.nativeHost = new NativeHostClient();
     // Load the cached tab ID from storage (async, but isTabFlowTab
@@ -51,29 +63,50 @@ export class TabManager {
   }
 
   /**
-   * Ensures the main Chrome window is visible in the Windows taskbar.
-   * Calls showWindow on the native host with the active tab's title.
-   * No-op if the native host isn't available or the window is already visible.
-   * Call this on startup to undo any WS_EX_TOOLWINDOW that was accidentally
-   * applied to the main window during a previous session.
+   * Ensures the main browser window is visible to the user.
    */
   async ensureMainWindowVisible(): Promise<void> {
-    if (!this.nativeHostAvailable) return;
     try {
       const mainWindowId = await this.getMainWindowId();
       if (mainWindowId === undefined) return;
 
-      const mainTabs = await chrome.tabs.query({ windowId: mainWindowId, active: true });
-      if (mainTabs.length > 0 && mainTabs[0].title) {
-        await this.nativeHost.showWindow(mainTabs[0].title);
-        console.log('[TabFlow] Ensured main window is visible in taskbar');
+      try {
+        const win = await chrome.windows.get(mainWindowId);
+        if (win.state === 'minimized') {
+          await chrome.windows.update(mainWindowId, { state: 'normal' });
+          console.log('[TabFlow] Unminimized main window');
+        }
+      } catch {
+        // Non-fatal
       }
-    } catch (e) {
+
+      if (this.nativeHostAvailable) {
+        const mainTabs = await chrome.tabs.query({ windowId: mainWindowId, active: true });
+        if (mainTabs.length > 0 && mainTabs[0].title) {
+          await this.nativeHost.showWindow(mainTabs[0].title);
+          console.log('[TabFlow] Ensured main window is visible in taskbar');
+        }
+      }
+    } catch {
       // Non-critical
     }
   }
 
-  /** Called by ensureTabFlowTab to keep the cached ID in sync */
+  /**
+   * After extension reload, re-hide minimized hidden-workspace windows.
+   */
+  async rehideInactiveWorkspaceWindows(): Promise<void> {
+    if (!this.nativeHostAvailable) return;
+    try {
+      const count = await this.nativeHost.hideMinimized(isFirefox ? 'firefox' : 'chrome');
+      if (count > 0) {
+        console.log(`[TabFlow] Rehid ${count} hidden workspace window(s) after reload`);
+      }
+    } catch (e) {
+      console.warn('[TabFlow] Failed to re-hide windows after reload:', e);
+    }
+  }
+
   setTabFlowTabId(tabId: number): void {
     this.cachedTabFlowTabId = tabId;
     console.log(`[TabFlow] TabManager cached TabFlow tab ID updated: ${tabId}`);
@@ -83,9 +116,6 @@ export class TabManager {
     return this.cachedTabFlowTabId;
   }
 
-  /**
-   * Close the hidden window for a given workspace and remove it from the map.
-   */
   async closeHiddenWindow(workspaceId: string): Promise<void> {
     const map = await this.getHiddenWindowMap();
     const hiddenWindowId = map[workspaceId];
@@ -102,10 +132,6 @@ export class TabManager {
     await this.setHiddenWindowMap(map);
   }
 
-  /**
-   * Close ALL hidden windows and clear the map entirely.
-   * Used during emergency cleanup to eliminate all hidden tabs.
-   */
   async closeAllHiddenWindows(): Promise<void> {
     const map = await this.getHiddenWindowMap();
     for (const [workspaceId, windowId] of Object.entries(map)) {
@@ -120,11 +146,6 @@ export class TabManager {
     console.log('[TabFlow] All hidden windows closed and map cleared');
   }
 
-  /**
-   * Connects to the native host and checks availability.
-   * Called once on startup. If the host isn't installed, all native
-   * calls gracefully degrade (hidden windows still work, just visible in taskbar).
-   */
   async initNativeHost(): Promise<boolean> {
     try {
       this.nativeHost.connect();
@@ -141,9 +162,6 @@ export class TabManager {
     return this.nativeHostAvailable;
   }
 
-  /**
-   * Checks if a URL should be tracked as a workspace tab.
-   */
   isTrackableUrl(url: string): boolean {
     if (!url) return false;
     if (this.isSuspendedUrl(url)) return true;
@@ -154,12 +172,10 @@ export class TabManager {
     return true;
   }
 
-  /** Checks if a URL is a TabFlow suspended tab */
   isSuspendedUrl(url: string): boolean {
     return url.startsWith(`${getExtensionBaseUrl()}suspended.html`);
   }
 
-  /** Extracts the real URL from a suspended tab URL */
   getRealUrl(url: string): string {
     if (!this.isSuspendedUrl(url)) return url;
     try {
@@ -170,7 +186,6 @@ export class TabManager {
     }
   }
 
-  /** Converts a Chrome tab to a TabFlow Tab model */
   private chromeTabToTab(chromeTab: chrome.tabs.Tab, workspaceId: string): Tab {
     const rawUrl = chromeTab.url || '';
     const isSuspended = this.isSuspendedUrl(rawUrl);
@@ -202,24 +217,24 @@ export class TabManager {
     };
   }
 
-  /**
-   * Gets trackable tabs in a specific window or the current window.
-   *
-   * IMPORTANT: When called from a service worker during workspace switches,
-   * always pass an explicit windowId. Using { currentWindow: true } in a
-   * service worker means "last focused window" which can be WRONG during
-   * the window shuffling of a workspace switch.
-   *
-   * @param windowId Explicit window ID to query. If omitted, uses currentWindow.
-   */
   async getCurrentWindowTabs(windowId?: number): Promise<Tab[]> {
     try {
       const query = windowId !== undefined
         ? { windowId }
         : { currentWindow: true as const };
       const chromeTabs = await chrome.tabs.query(query);
+      // 0.1.56: Filter out hidden tabs. `chrome.tabs.query` returns hidden
+      // tabs by default. When another workspace's persistent (pushpin'd)
+      // tab is hidden via `chrome.tabs.hide()`, it still lives in the main
+      // window — but it belongs to that OTHER workspace, not the current
+      // one. Including it in the current workspace's snapshot creates
+      // phantom cross-workspace tab records (Sam saw his YouTube PIP tab
+      // duplicated into the Guns workspace when he was watching a video
+      // pushpinned in YouTube while working in Guns). The hidden tab is
+      // already tracked by its own workspace's records + the hiddenTabs
+      // map — skip it here.
       const trackableTabs = chromeTabs.filter(
-        (tab) => this.isTrackableUrl(tab.url || '')
+        (tab) => !tab.hidden && this.isTrackableUrl(tab.url || '')
       );
 
       return trackableTabs.map((chromeTab, index) => {
@@ -233,61 +248,55 @@ export class TabManager {
     }
   }
 
-  /** Alias for getCurrentWindowTabs */
   async getCurrentTabs(): Promise<Tab[]> {
     return this.getCurrentWindowTabs();
   }
 
-  /**
-   * Saves all current browser tabs to a workspace in storage.
-   *
-   * DETERMINISTIC-ID MODEL (post-migration):
-   * Tab IDs are derived from `workspaceId | canonicalUrl | createdAt`. The
-   * same tab keeps the same ID across snapshots, across browsers, and
-   * forever. Supabase upserts become idempotent.
-   *
-   * Matching strategy:
-   *   1. For each live Chrome tab, find an existing record in the same
-   *      workspace whose canonicalized URL matches and hasn't been claimed
-   *      by an earlier match. Prefer the oldest-`createdAt` record (so
-   *      the "first" duplicate tab stays the "first" across restarts).
-   *   2. If matched, REUSE its ID and `createdAt`. Update mutable fields
-   *      (title, favicon, sortOrder, updatedAt, lastAccessed).
-   *   3. If not matched, MINT a new record with `createdAt = now` and
-   *      compute a deterministic ID from it.
-   *   4. Any existing `chrome-`, `restart-`, or `tab-` record that wasn't
-   *      matched to a live tab is deleted (tab was closed).
-   *   5. `moved-` and `dup-` records are preserved verbatim — they
-   *      represent cross-workspace moves that haven't materialized as
-   *      Chrome tabs yet.
-   */
-  async saveCurrentTabsToWorkspace(workspaceId: string, storage: any, windowId?: number): Promise<void> {
+  async saveCurrentTabsToWorkspace(
+    workspaceId: string,
+    storage: any,
+    windowId?: number,
+  ): Promise<{ deletedTabIds: string[] }> {
     try {
       console.log(`[TabFlow] Saving current tabs to workspace ${workspaceId} (window: ${windowId ?? 'current'})`);
 
       const currentTabs = await this.getCurrentWindowTabs(windowId);
 
-      if (currentTabs.length === 0) {
-        console.log(`[TabFlow] No trackable tabs found — keeping existing records for workspace ${workspaceId}`);
-        return;
+      // 0.1.31: Pull matching chrome tab IDs in same order/filter so we can
+      // build a chromeTabId -> storageId cache for thumbnail capture.
+      // 0.1.56: Also filter out hidden tabs (see getCurrentWindowTabs
+      // comment) so the chromeTabId cache doesn't associate other
+      // workspaces' hidden tabs with this workspace's records.
+      let currentChromeTabIds: (number | undefined)[] = [];
+      try {
+        const query = windowId !== undefined
+          ? { windowId }
+          : { currentWindow: true as const };
+        const rawChromeTabs = await chrome.tabs.query(query);
+        const filtered = rawChromeTabs.filter((t) => !t.hidden && this.isTrackableUrl(t.url || ''));
+        currentChromeTabIds = filtered.map((t) => t.id);
+      } catch {
+        currentChromeTabIds = [];
       }
 
-      // SAFETY: If Chrome reports an unreasonable number of tabs, something is wrong.
-      // Only save up to MAX_RESTORE_TABS to prevent database corruption.
+      if (currentTabs.length === 0) {
+        console.log(`[TabFlow] No trackable tabs found — keeping existing records for workspace ${workspaceId}`);
+        return { deletedTabIds: [] };
+      }
+
       if (currentTabs.length > TabManager.MAX_RESTORE_TABS) {
         console.warn(`[TabFlow] SAFETY CAP: ${currentTabs.length} tabs in window, only saving first ${TabManager.MAX_RESTORE_TABS}`);
         currentTabs.splice(TabManager.MAX_RESTORE_TABS);
+        if (currentChromeTabIds.length > TabManager.MAX_RESTORE_TABS) {
+          currentChromeTabIds.splice(TabManager.MAX_RESTORE_TABS);
+        }
       }
+
+      // Fresh cache for this workspace.
+      const newChromeTabToStorageId = new Map<number, string>();
 
       const existingTabs: Tab[] = await storage.getTabs(workspaceId);
 
-      // ALL existing records participate in URL matching — including
-      // moved-*/dup-* placeholders. If a placeholder's URL matches a
-      // currently-open Chrome tab, we consume it and replace with a
-      // deterministic ID. If it's unmatched, we preserve it only if
-      // it's a placeholder (still awaiting materialization on a future
-      // workspace switch); otherwise it represents a closed tab and
-      // gets deleted.
       const matchableByUrl = new Map<string, Tab[]>();
       for (const t of existingTabs) {
         const key = canonicalizeUrl(t.url);
@@ -295,9 +304,6 @@ export class TabManager {
         list.push(t);
         matchableByUrl.set(key, list);
       }
-      // Within each URL bucket, sort oldest-first so we consume existing
-      // records in the order their tabs were originally added. `createdAt`
-      // may be missing on legacy records — fall back to `updatedAt`.
       for (const list of matchableByUrl.values()) {
         list.sort((a, b) => {
           const aT = (a.createdAt ?? a.updatedAt) as Date;
@@ -308,12 +314,13 @@ export class TabManager {
 
       const now = new Date();
       const recordsToSave: Tab[] = [];
+      // 0.1.53: Track the source-record ID for each recordToSave (or null
+      // for freshly-minted). Used just before the write loop to re-fetch
+      // the current `persistent` flag from DB — closes the race where a
+      // concurrent handleToggleTabPersistent write lands between our
+      // initial read of existingTabs and our final write.
+      const recordSourceIds: (string | null)[] = [];
 
-      // Tracking for the cleanup sweep:
-      //   reuseIds       = existing records we kept verbatim (same ID).
-      //   rewriteIds     = existing records whose URL was claimed but we
-      //                    minted a new deterministic ID; the old record
-      //                    must be deleted.
       const reuseIds = new Set<string>();
       const rewriteIds = new Set<string>();
       let reused = 0;
@@ -322,6 +329,7 @@ export class TabManager {
 
       for (let i = 0; i < currentTabs.length; i++) {
         const live = currentTabs[i];
+        const chromeTabId = currentChromeTabIds[i];
         const key = canonicalizeUrl(live.url);
         const bucket = matchableByUrl.get(key);
         const match = bucket && bucket.length > 0 ? bucket.shift()! : undefined;
@@ -332,8 +340,9 @@ export class TabManager {
           id.startsWith('moved-') ||
           id.startsWith('dup-');
 
+        let resolvedId: string;
+
         if (match && !isLegacyId(match.id)) {
-          // Existing deterministic record — reuse verbatim.
           reuseIds.add(match.id);
           recordsToSave.push({
             ...match,
@@ -344,10 +353,13 @@ export class TabManager {
             sortOrder: i,
             lastAccessed: now,
             updatedAt: now,
+            scrollX: match.scrollX,
+            scrollY: match.scrollY,
           });
+          recordSourceIds.push(match.id);
           reused++;
+          resolvedId = match.id;
         } else if (match) {
-          // Legacy ID match — claim its createdAt, mint a new deterministic ID.
           const createdAt = (match.createdAt ?? match.updatedAt) as Date;
           const id = await computeTabId(workspaceId, live.url, new Date(createdAt));
           rewriteIds.add(match.id);
@@ -362,10 +374,20 @@ export class TabManager {
             lastAccessed: now,
             updatedAt: now,
             createdAt: new Date(createdAt),
+            scrollX: match.scrollX,
+            scrollY: match.scrollY,
+            // 0.1.53: Preserve the persistent (pushpin) flag across URL
+            // changes. Without this, a YouTube tab that's the currently-
+            // playing video (its URL updates every 10s via the
+            // youtube-time-tracker `&t=Ns` rewrite) would lose its
+            // pushpin every 10 seconds because the rewrite path was
+            // dropping the field.
+            persistent: match.persistent,
           });
+          recordSourceIds.push(match.id);
           rewritten++;
+          resolvedId = id;
         } else {
-          // No match — fresh tab. createdAt = now.
           const createdAt = now;
           const id = await computeTabId(workspaceId, live.url, createdAt);
           recordsToSave.push({
@@ -380,74 +402,228 @@ export class TabManager {
             updatedAt: now,
             createdAt,
           });
+          recordSourceIds.push(null);
           minted++;
+          resolvedId = id;
+        }
+
+        if (chromeTabId !== undefined) {
+          newChromeTabToStorageId.set(chromeTabId, resolvedId);
         }
       }
 
-      // Cleanup sweep over the ORIGINAL existing records.
-      //   reuseIds   → already in recordsToSave with same ID, skip.
-      //   rewriteIds → legacy record replaced by a new deterministic ID, delete the old row.
-      //   neither    → truly unmatched. Preserve if moved-*/dup-* (pending
-      //                materialization), otherwise delete (closed tab).
       let deleted = 0;
       let preservedPending = 0;
+      let preservedInert = 0;
+      const deletedTabIds: string[] = [];
       for (const t of existingTabs) {
         if (reuseIds.has(t.id)) continue;
         if (rewriteIds.has(t.id)) {
           await storage.deleteTab(t.id);
+          deletedTabIds.push(t.id);
           deleted++;
           continue;
         }
+        if (crossBrowserOnlyLabel(t.url) !== null) {
+          preservedInert++;
+          continue;
+        }
+        if (!isUrlOpenable(t.url)) {
+          preservedInert++;
+          continue;
+        }
         if (t.id.startsWith('moved-') || t.id.startsWith('dup-')) {
-          preservedPending++;
+          // 0.1.50: don't preserve moved-*/dup-* placeholders that have
+          // no matching live tab. These are stale in-flight IDs that
+          // outlived their operation (Sam's 0.1.49 diagnostic showed
+          // moved-17 lingering across multiple workspaces). Delete the
+          // orphan; a subsequent snapshot with the URL live will mint
+          // a proper deterministic tab-<hash> ID.
+          await storage.deleteTab(t.id);
+          deletedTabIds.push(t.id);
+          deleted++;
+          try {
+            await logDiagnostic('cleanup', 'deleted orphan placeholder tab', {
+              oldId: t.id,
+              workspaceId: workspaceId?.slice(0, 8),
+              url: (t.url ?? '').slice(0, 60),
+            });
+          } catch {}
           continue;
         }
         await storage.deleteTab(t.id);
+        deletedTabIds.push(t.id);
         deleted++;
       }
 
-      // Persist the new/updated records.
-      for (const t of recordsToSave) {
+      // 0.1.53: Fresh re-read of persistent flags right before writing.
+      //
+      // The snapshot's read-modify-write is not atomic. A concurrent
+      // handleToggleTabPersistent write can land between our initial read
+      // of existingTabs and this write loop, and get clobbered by our
+      // stale in-memory copy. Sam hit this: clicked the pushpin on a
+      // YouTube video, then clicked to switch workspaces, PIP tab was
+      // closed because the switch's snapshot overwrote persistent=true
+      // with the pre-toggle persistent=false.
+      //
+      // Fix: re-read persistent from DB right before writing, and use the
+      // fresh value. Combined with the faster pushpin handler in 0.1.53
+      // (workspaceId-scoped lookup instead of iterating all workspaces)
+      // the race window is effectively closed.
+      const freshPersistentById = new Map<string, boolean>();
+      try {
+        const freshTabs = await storage.getTabs(workspaceId);
+        for (const t of freshTabs) {
+          freshPersistentById.set(t.id, !!t.persistent);
+        }
+      } catch (err) {
+        console.warn('[TabFlow] Fresh persistent re-read failed, using in-memory values:', err);
+      }
+
+      for (let idx = 0; idx < recordsToSave.length; idx++) {
+        const t = recordsToSave[idx];
+        const src = recordSourceIds[idx];
+        if (src) {
+          const fresh = freshPersistentById.get(src);
+          if (fresh !== undefined) {
+            t.persistent = fresh;
+          }
+        }
         await storage.saveTab(t);
       }
 
       console.log(
         `[TabFlow] Saved ${recordsToSave.length} tabs to workspace ${workspaceId} ` +
         `(reused ${reused}, rewritten ${rewritten}, minted ${minted}, ` +
-        `deleted ${deleted}, preserved ${preservedPending} pending)`
+        `deleted ${deleted}, preserved ${preservedPending} pending, ` +
+        `preserved ${preservedInert} cross-browser)`
       );
+
+      // 0.1.31: Replace the cache wholesale with the freshly-built mapping.
+      this.chromeTabToStorageId = newChromeTabToStorageId;
+
+      return { deletedTabIds };
     } catch (error) {
       console.error('[TabFlow] Error saving tabs to workspace:', error);
+      return { deletedTabIds: [] };
     }
   }
 
-  /** Checks if a Chrome tab is the pinned TabFlow tab.
+  /**
+   * 0.1.50: sweep the given workspace's DB records for stale placeholder
+   * IDs (`moved-<n>` / `dup-<n>`) and regenerate them into proper
+   * deterministic `tab-<16hex>` IDs.
    *
-   * Uses the cached tab ID as PRIMARY detection (most reliable).
-   * Falls back to URL and position checks when the cache isn't ready.
-   * Getting this wrong means moveTabsToHiddenWindow moves the TabFlow
-   * tab to the hidden window, leaving the main window empty → Chrome closes.
+   * These placeholders come from in-flight move / duplicate operations
+   * that never got renamed. Sam's 0.1.49 diagnostic showed `moved-17`
+   * appearing in multiple workspaces' pushes — meaning the placeholder
+   * outlived the operation. Called from startup reconcile so any
+   * accumulated placeholders are cleaned up on browser start.
+   *
+   * If a placeholder's URL matches another record already at a proper
+   * `tab-<hash>` ID, we DELETE the placeholder (dedupe) rather than
+   * create a second row for the same URL.
    */
+  async sweepStalePlaceholderIds(
+    workspaceId: string,
+    storage: any,
+  ): Promise<{ renamed: number; deduped: number }> {
+    let renamed = 0;
+    let deduped = 0;
+    try {
+      const records: Tab[] = await storage.getTabs(workspaceId);
+      const stale = records.filter((t) =>
+        /^moved-\d+$/.test(t.id) || /^dup-\d+$/.test(t.id)
+      );
+      if (stale.length === 0) return { renamed, deduped };
+
+      // Build a canonical-URL → proper-record lookup for dedupe
+      const properByUrl = new Map<string, Tab>();
+      for (const t of records) {
+        if (/^tab-[0-9a-f]{16}$/.test(t.id)) {
+          properByUrl.set(canonicalizeUrl(t.url ?? ''), t);
+        }
+      }
+
+      for (const bad of stale) {
+        const canon = canonicalizeUrl(bad.url ?? '');
+        const existingProper = properByUrl.get(canon);
+        if (existingProper) {
+          // Dedupe: proper record already exists for this URL
+          try {
+            await storage.deleteTab(bad.id);
+            deduped++;
+            try {
+              await logDiagnostic('cleanup', 'deduped stale moved-* tab', {
+                oldId: bad.id,
+                keepId: existingProper.id?.slice(0, 12),
+                workspaceId: workspaceId?.slice(0, 8),
+              });
+            } catch {}
+          } catch (err) {
+            console.warn('[TabFlow] sweepStalePlaceholderIds: dedupe failed', err);
+          }
+          continue;
+        }
+        // Regenerate: create new record with deterministic ID
+        try {
+          const createdAt = (bad.createdAt ?? bad.updatedAt ?? new Date()) as Date;
+          const newId = await computeTabId(workspaceId, bad.url ?? '', new Date(createdAt));
+          await storage.saveTab({ ...bad, id: newId });
+          await storage.deleteTab(bad.id);
+          properByUrl.set(canon, { ...bad, id: newId });
+          renamed++;
+          try {
+            await logDiagnostic('cleanup', 'renamed moved-* tab', {
+              oldId: bad.id,
+              newId: newId?.slice(0, 12),
+              workspaceId: workspaceId?.slice(0, 8),
+            });
+          } catch {}
+        } catch (err) {
+          console.warn('[TabFlow] sweepStalePlaceholderIds: rename failed', err);
+        }
+      }
+    } catch (err) {
+      console.warn('[TabFlow] sweepStalePlaceholderIds: outer failure', err);
+    }
+    return { renamed, deduped };
+  }
+
+  /**
+   * Look up the deterministic storage ID for a given Chrome tab ID in
+   * the active workspace. Returns null if no mapping is known.
+   */
+  getStorageIdForTab(chromeTabId: number): string | null {
+    return this.chromeTabToStorageId.get(chromeTabId) ?? null;
+  }
+
+  /**
+   * Reverse lookup: storage ID -> Chrome tab ID. Used by thumbnail backfill.
+   */
+  getChromeTabIdForStorageId(storageId: string): number | null {
+    for (const [chromeId, sid] of this.chromeTabToStorageId.entries()) {
+      if (sid === storageId) return chromeId;
+    }
+    return null;
+  }
+
   isTabFlowTab(tab: chrome.tabs.Tab): boolean {
-    // Strategy 1: Cached tab ID (most reliable — works regardless of URL)
     if (this.cachedTabFlowTabId !== undefined && tab.id === this.cachedTabFlowTabId) {
       return true;
     }
 
     const url = tab.url || '';
 
-    // Strategy 2: Check by extension URL
     if (url && !this.isSuspendedUrl(url)) {
       if (url.startsWith(getExtensionBaseUrl())) return true;
     }
 
-    // Strategy 3: Check by pendingUrl (during navigation)
     const pendingUrl = (tab as any).pendingUrl || '';
     if (pendingUrl && pendingUrl.startsWith(getExtensionBaseUrl())) {
       return true;
     }
 
-    // Strategy 4: Pinned tab at index 0 — always assumed to be TabFlow
     if (tab.pinned && tab.index === 0) {
       return true;
     }
@@ -455,11 +631,6 @@ export class TabManager {
     return false;
   }
 
-  /**
-   * Closes all tabs in the current window EXCEPT the TabFlow pinned tab.
-   * SAFETY: If closing all tabs would leave the window empty (and Chrome
-   * would close the window), creates a blank tab first to keep it alive.
-   */
   async closeAllTabs(): Promise<void> {
     try {
       const chromeTabs = await chrome.tabs.query({ currentWindow: true });
@@ -473,12 +644,8 @@ export class TabManager {
         return;
       }
 
-      // CRITICAL SAFETY CHECK: If ALL tabs are closeable (i.e., the TabFlow
-      // tab wasn't found — maybe it hasn't loaded yet), create a blank tab
-      // first so Chrome doesn't close the entire window.
       if (closeableTabs.length === chromeTabs.length) {
         console.log('[TabFlow] Creating safety blank tab before closing all tabs to prevent window closure');
-        // Use explicit windowId from any existing tab to avoid "No current window"
         const windowId = chromeTabs[0]?.windowId;
         await chrome.tabs.create({ url: 'about:blank', active: false, ...(windowId ? { windowId } : {}) });
       }
@@ -493,7 +660,6 @@ export class TabManager {
     }
   }
 
-  /** Builds a suspended tab URL */
   private buildSuspendedUrl(tab: Tab): string {
     const params = new URLSearchParams();
     params.set('url', tab.url);
@@ -504,20 +670,6 @@ export class TabManager {
     return `${getExtensionBaseUrl()}suspended.html?${params.toString()}`;
   }
 
-  /**
-   * Opens tabs in SUSPENDED state and remaps IDs in storage.
-   * Fallback for when no hidden window exists (e.g., after browser restart).
-   *
-   * @param tabs The tabs to restore
-   * @param storageAdapter Optional storage adapter for remapping tab IDs
-   * @param targetWindowId The window to create tabs in. MUST be provided by
-   *   the caller (captured before any tab moves) to avoid "No current window" errors.
-   */
-  /**
-   * Maximum number of tabs to restore at once. Prevents runaway tab creation
-   * from corrupted database records. If a workspace has more than this many
-   * stored tabs, only the first MAX are restored and the rest are skipped.
-   */
   static readonly MAX_RESTORE_TABS = 30;
 
   async restoreWorkspaceTabs(tabs: Tab[], storageAdapter?: any, targetWindowId?: number): Promise<void> {
@@ -527,13 +679,11 @@ export class TabManager {
         return;
       }
 
-      // SAFETY CAP: Never restore more than MAX_RESTORE_TABS at once.
       if (tabs.length > TabManager.MAX_RESTORE_TABS) {
         console.warn(`[TabFlow] SAFETY CAP: workspace has ${tabs.length} tabs, only restoring first ${TabManager.MAX_RESTORE_TABS}`);
         tabs = tabs.slice(0, TabManager.MAX_RESTORE_TABS);
       }
 
-      // Use the provided window ID, or try to find the main window as fallback
       let windowId = targetWindowId;
       if (windowId === undefined) {
         windowId = await this.getMainWindowId();
@@ -545,42 +695,68 @@ export class TabManager {
 
       console.log(`[TabFlow] Restoring ${tabs.length} tabs as suspended in window ${windowId}`);
 
+      let skippedPrivileged = 0;
       for (const tab of tabs) {
+        if (crossBrowserOnlyLabel(tab.url) !== null) {
+          skippedPrivileged++;
+          continue;
+        }
         try {
           const suspendedUrl = this.buildSuspendedUrl(tab);
-          // NEVER restore workspace tabs as pinned. Only the TabFlow tab
-          // should be pinned (at index 0). Restoring a pinned tab would
-          // push the TabFlow tab out of position and corrupt pin state.
           const created = await chrome.tabs.create({
             url: suspendedUrl,
             active: false,
             pinned: false,
             windowId: windowId,
           });
-
-          // DETERMINISTIC-ID MODEL: We no longer remap to `chrome-<id>` on
-          // restore. The storage record's ID is content-derived and stays
-          // stable. The next snapshot will match the newly-opened Chrome
-          // tab back to this record by URL and just update display fields.
-          //
-          // For legacy records (moved-*/dup-*) whose tabs are being
-          // materialized here, we leave the legacy ID alone — the next
-          // snapshot will rewrite it to a tab-<hash> ID via the legacy-match
-          // path in saveCurrentTabsToWorkspace.
-          void created; // silence unused-variable warning
+          void created;
           void storageAdapter;
         } catch (error) {
           console.error(`[TabFlow] Error creating suspended tab for ${tab.url}:`, error);
         }
       }
 
-      console.log(`[TabFlow] Successfully restored ${tabs.length} suspended tabs`);
+      console.log(`[TabFlow] Successfully restored ${tabs.length - skippedPrivileged} suspended tabs${skippedPrivileged > 0 ? ` (${skippedPrivileged} privileged-URL tiles skipped)` : ''}`);
     } catch (error) {
       console.error('[TabFlow] Error restoring workspace tabs:', error);
     }
   }
 
-  /** Gets the currently active tab */
+  async dedupeTabsInWindow(windowId: number): Promise<number> {
+    try {
+      const tabs = await chrome.tabs.query({ windowId });
+      const groups = new Map<string, chrome.tabs.Tab[]>();
+      for (const t of tabs) {
+        if (!t.id || !t.url) continue;
+        if (this.isTabFlowTab(t)) continue;
+        const realUrl = this.getRealUrl(t.url);
+        const key = canonicalizeUrl(realUrl);
+        const list = groups.get(key) ?? [];
+        list.push(t);
+        groups.set(key, list);
+      }
+
+      let closed = 0;
+      for (const [, list] of groups) {
+        if (list.length <= 1) continue;
+        list.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+        const toClose = list.slice(1).map((t) => t.id!).filter((id) => id !== undefined);
+        if (toClose.length > 0) {
+          try {
+            await chrome.tabs.remove(toClose);
+            closed += toClose.length;
+          } catch (e) {
+            console.warn('[TabFlow] dedupeTabsInWindow: failed to close a duplicate:', e);
+          }
+        }
+      }
+      return closed;
+    } catch (err) {
+      console.error('[TabFlow] dedupeTabsInWindow failed:', err);
+      return 0;
+    }
+  }
+
   async getActiveTab(): Promise<Tab | null> {
     try {
       const chromeTabs = await chrome.tabs.query({
@@ -596,48 +772,33 @@ export class TabManager {
     }
   }
 
-  // ─── Hidden Window Management ────────────────────────────────────
-  // Instead of closing tabs and creating suspended ones, we move tabs
-  // to minimized "hidden" windows. This preserves full tab state:
-  // video playback position, scroll position, form data, etc.
-  // The mapping is stored in chrome.storage.local so it survives both
-  // service worker restarts AND extension reloads. On startup, stale
-  // entries (windows that no longer exist) are cleaned up.
-
-  /**
-   * Gets the workspace → hidden windowId mapping
-   */
   async getHiddenWindowMap(): Promise<Record<string, number>> {
     const result = await chrome.storage.local.get('hiddenWindows');
     return result.hiddenWindows || {};
   }
 
-  /**
-   * Stores the workspace → hidden windowId mapping
-   */
+  async getWorkspaceForHiddenWindow(windowId: number): Promise<string | null> {
+    const map = await this.getHiddenWindowMap();
+    for (const [workspaceId, hiddenWindowId] of Object.entries(map)) {
+      if (hiddenWindowId === windowId) return workspaceId;
+    }
+    return null;
+  }
+
   private async setHiddenWindowMap(map: Record<string, number>): Promise<void> {
     await chrome.storage.local.set({ hiddenWindows: map });
   }
 
-  /**
-   * Validates hidden window entries on startup.
-   * Removes stale entries for windows that no longer exist (e.g. after
-   * browser restart). This prevents the map from growing forever.
-   */
   async cleanupStaleHiddenWindows(): Promise<void> {
     try {
       const map = await this.getHiddenWindowMap();
       const entries = Object.entries(map);
       if (entries.length === 0) return;
 
-      // Get the main window ID so we can detect ID reuse after Chrome restart.
-      // Chrome can reuse old window IDs — a hidden window ID from before restart
-      // might now be the main window.
       const mainWindowId = await this.getMainWindowId();
 
       let changed = false;
       for (const [workspaceId, windowId] of entries) {
-        // If the stored ID now matches the main window, it's stale (ID reuse)
         if (mainWindowId !== undefined && windowId === mainWindowId) {
           delete map[workspaceId];
           changed = true;
@@ -647,7 +808,6 @@ export class TabManager {
 
         try {
           const tabs = await chrome.tabs.query({ windowId });
-          // If the window has no tabs, it's dead — clean it up
           if (tabs.length === 0) {
             try { await chrome.windows.remove(windowId); } catch {}
             delete map[workspaceId];
@@ -655,7 +815,6 @@ export class TabManager {
             console.log(`[TabFlow] Cleaned up empty hidden window for workspace ${workspaceId}`);
           }
         } catch {
-          // Window doesn't exist anymore
           delete map[workspaceId];
           changed = true;
           console.log(`[TabFlow] Cleaned up stale hidden window entry for workspace ${workspaceId}`);
@@ -671,22 +830,12 @@ export class TabManager {
     }
   }
 
-  /**
-   * Gets the main window ID (the window containing the TabFlow pinned tab).
-   *
-   * Uses multiple strategies in case the TabFlow tab's URL isn't visible
-   * yet (e.g., during startup or after tab moves):
-   * 1. Search all tabs for the TabFlow extension URL
-   * 2. Search for any pinned tab in position 0 (TabFlow is always pinned at index 0)
-   * 3. Fall back to the last focused window
-   */
   async getMainWindowId(): Promise<number | undefined> {
     try {
       const extBase = getExtensionBaseUrl();
       const suspendedPrefix = `${extBase}suspended.html`;
       const allTabs = await chrome.tabs.query({});
 
-      // Strategy 1: Find by extension URL
       const tabFlowTab = allTabs.find(
         (t) =>
           t.url?.startsWith(extBase) &&
@@ -696,7 +845,6 @@ export class TabManager {
         return tabFlowTab.windowId;
       }
 
-      // Strategy 2: Find a pinned tab at index 0 (TabFlow is always pinned first)
       const pinnedAtZero = allTabs.find(
         (t) => t.pinned && t.index === 0
       );
@@ -705,7 +853,6 @@ export class TabManager {
         return pinnedAtZero.windowId;
       }
 
-      // Strategy 3: Fall back to the last focused window
       const lastFocused = await chrome.windows.getLastFocused();
       if (lastFocused?.id !== undefined) {
         console.log('[TabFlow] Found main window via last focused window');
@@ -719,21 +866,6 @@ export class TabManager {
     }
   }
 
-  /**
-   * Builds a map of canonical URL → live Chrome tab IDs for all tabs in
-   * the main window. Used by handlers that need to operate on Chrome tabs
-   * by storage-tab URL (close, move, reorder) now that deterministic storage
-   * IDs no longer carry the Chrome numeric tab ID.
-   *
-   * Values are arrays because duplicate URLs are allowed — the user can
-   * have the same URL open as multiple tiles, each backed by its own
-   * Chrome tab. Callers that consume one-at-a-time (e.g. "close this
-   * specific tile") should `shift()` off the front of the array so later
-   * calls within the same operation don't re-hit the same Chrome tab.
-   *
-   * Suspended-tab URLs are unwrapped to their real underlying URL so
-   * suspended tabs match their storage records.
-   */
   async buildMainWindowUrlIndex(): Promise<Map<string, number[]>> {
     const map = new Map<string, number[]>();
     const windowId = await this.getMainWindowId();
@@ -742,7 +874,6 @@ export class TabManager {
     const suspendedPrefix = `${getExtensionBaseUrl()}suspended.html`;
     for (const t of tabs) {
       if (!t.id || !t.url) continue;
-      // Skip the pinned TabFlow tab itself
       if (t.id === this.cachedTabFlowTabId) continue;
       let realUrl = t.url;
       if (t.url.startsWith(suspendedPrefix)) {
@@ -758,11 +889,6 @@ export class TabManager {
     return map;
   }
 
-  /**
-   * Moves all non-TabFlow tabs from the main window to a hidden minimized window.
-   * Stores the workspace→windowId mapping so we can bring them back later.
-   * @returns true if tabs were moved (or no tabs to move)
-   */
   async moveTabsToHiddenWindow(workspaceId: string): Promise<boolean> {
     try {
       const mainWindowId = await this.getMainWindowId();
@@ -779,12 +905,8 @@ export class TabManager {
         return true;
       }
 
-      // CRITICAL SAFETY: Never move ALL tabs out of the main window.
-      // If isTabFlowTab failed to detect the TabFlow tab, moving everything
-      // would leave the window empty and Chrome would close entirely.
       if (movableTabs.length === allTabs.length) {
         console.warn('[TabFlow] SAFETY: All tabs marked as movable — TabFlow tab not detected. Keeping pinned tab at index 0.');
-        // Find the pinned tab at index 0 (should be TabFlow) and exclude it
         const pinnedAtZero = allTabs.find((t) => t.pinned && t.index === 0);
         if (pinnedAtZero) {
           const safeMovableTabs = movableTabs.filter((t) => t.id !== pinnedAtZero.id);
@@ -792,7 +914,6 @@ export class TabManager {
             console.log('[TabFlow] No tabs to hide after safety filter');
             return true;
           }
-          // Use the filtered list instead
           const tabIds = safeMovableTabs.map((t) => t.id!).filter((id) => id !== undefined);
 
           const hiddenWindow = await chrome.windows.create({
@@ -822,20 +943,15 @@ export class TabManager {
             `[TabFlow] SAFETY: Moved ${tabIds.length} tabs (kept pinned tab) to hidden window ${hiddenWindow.id}`
           );
 
-          // Hide the hidden window from the taskbar via native host.
-          // First ensure the main window is focused so hideMinimized
-          // only catches the hidden workspace window, never the main one.
           await this.safeHideMinimizedWindows(mainWindowId);
 
           return true;
         }
 
-        // No pinned tab found either — abort to prevent Chrome from closing
         console.error('[TabFlow] SAFETY: Cannot find any TabFlow tab — aborting move to prevent Chrome closure');
         return false;
       }
 
-      // Create a minimized window (needs at least one URL)
       const hiddenWindow = await chrome.windows.create({
         state: 'minimized',
         url: 'about:blank',
@@ -846,11 +962,9 @@ export class TabManager {
         return false;
       }
 
-      // Move workspace tabs to the hidden window
       const tabIds = movableTabs.map((t) => t.id!).filter((id) => id !== undefined);
       await chrome.tabs.move(tabIds, { windowId: hiddenWindow.id, index: -1 });
 
-      // Close the about:blank placeholder tab
       const hiddenTabs = await chrome.tabs.query({ windowId: hiddenWindow.id });
       const blankTab = hiddenTabs.find(
         (t) => t.url === 'about:blank' && !tabIds.includes(t.id!)
@@ -859,7 +973,6 @@ export class TabManager {
         await chrome.tabs.remove(blankTab.id);
       }
 
-      // Store the mapping
       const map = await this.getHiddenWindowMap();
       map[workspaceId] = hiddenWindow.id;
       await this.setHiddenWindowMap(map);
@@ -868,9 +981,6 @@ export class TabManager {
         `[TabFlow] Moved ${tabIds.length} tabs to hidden window ${hiddenWindow.id} for workspace ${workspaceId}`
       );
 
-      // Hide the hidden window from the taskbar via native host.
-      // First ensure the main window is focused so hideMinimized
-      // only catches the hidden workspace window, never the main one.
       await this.safeHideMinimizedWindows(mainWindowId);
 
       return true;
@@ -880,11 +990,6 @@ export class TabManager {
     }
   }
 
-  /**
-   * Restores tabs from a hidden window back to the main window.
-   * Preserves full tab state (video position, scroll, forms, etc.)
-   * @returns true if tabs were restored from a hidden window
-   */
   async restoreTabsFromHiddenWindow(workspaceId: string): Promise<boolean> {
     try {
       const map = await this.getHiddenWindowMap();
@@ -892,19 +997,16 @@ export class TabManager {
 
       if (!hiddenWindowId) return false;
 
-      // Verify the hidden window still exists
       let hiddenTabs: chrome.tabs.Tab[];
       try {
         hiddenTabs = await chrome.tabs.query({ windowId: hiddenWindowId });
       } catch {
-        // Window was closed or doesn't exist
         delete map[workspaceId];
         await this.setHiddenWindowMap(map);
         return false;
       }
 
       if (hiddenTabs.length === 0) {
-        // Window exists but has no tabs — clean up
         try { await chrome.windows.remove(hiddenWindowId); } catch {}
         delete map[workspaceId];
         await this.setHiddenWindowMap(map);
@@ -917,7 +1019,6 @@ export class TabManager {
         return false;
       }
 
-      // SAFETY: Never restore from a window that IS the main window
       if (hiddenWindowId === mainWindowId) {
         console.error('[TabFlow] SAFETY: Hidden window ID matches main window ID — aborting restore');
         delete map[workspaceId];
@@ -925,11 +1026,9 @@ export class TabManager {
         return false;
       }
 
-      // Move all tabs back to the main window
       const tabIds = hiddenTabs.map((t) => t.id!).filter((id) => id !== undefined);
       await chrome.tabs.move(tabIds, { windowId: mainWindowId, index: -1 });
 
-      // Close the now-empty hidden window (verify it's not the main window)
       try {
         if (hiddenWindowId !== mainWindowId) {
           await chrome.windows.remove(hiddenWindowId);
@@ -938,7 +1037,6 @@ export class TabManager {
         // May have auto-closed
       }
 
-      // Clean up mapping
       delete map[workspaceId];
       await this.setHiddenWindowMap(map);
 
@@ -952,49 +1050,36 @@ export class TabManager {
     }
   }
 
-  /**
-   * Safely hides minimized Chrome windows from the taskbar.
-   * FIRST ensures the main window is focused/restored so it can never
-   * accidentally be hidden. Then calls the native host to hide only
-   * truly minimized windows (the hidden workspace windows).
-   * AFTER hiding, explicitly restores the main window's taskbar presence
-   * to undo any accidental hiding caused by race conditions.
-   *
-   * Uses fire-and-forget with a delay so it can't block workspace switches.
-   */
   private async safeHideMinimizedWindows(mainWindowId: number): Promise<void> {
     if (!this.nativeHostAvailable) return;
 
-    // Ensure the main window is focused/normal — NOT minimized.
-    // This guarantees hideMinimized won't touch it.
     try {
       await chrome.windows.update(mainWindowId, { focused: true });
     } catch (e) {
       console.warn('[TabFlow] Could not focus main window before hiding:', e);
-      return; // Don't hide if we can't guarantee the main window is safe
+      return;
     }
 
-    // Small delay to let Windows register the focus change
     setTimeout(async () => {
       try {
-        // Double-check the main window state before hiding
         const mainWindow = await chrome.windows.get(mainWindowId);
         if (mainWindow.state === 'minimized') {
           console.warn('[TabFlow] Main window is still minimized — skipping hideMinimized');
           return;
         }
-        const count = await this.nativeHost.hideMinimized();
+        const count = await this.nativeHost.hideMinimized(isFirefox ? 'firefox' : 'chrome');
         console.log(`[TabFlow] hideMinimized result: ${count} windows hidden`);
 
-        // SAFETY NET: After hiding minimized windows, explicitly restore
-        // the main window's taskbar presence. This undoes any accidental
-        // hiding if the main window was briefly minimized during the operation.
-        // We find the main window's active tab title and call showWindow.
         try {
+          const mainWindow = await chrome.windows.get(mainWindowId);
+          if (mainWindow.state === 'minimized') {
+            await chrome.windows.update(mainWindowId, { state: 'normal' });
+            console.log('[TabFlow] Safety net: unminimized main window after hideMinimized');
+          }
           const mainTabs = await chrome.tabs.query({ windowId: mainWindowId, active: true });
           if (mainTabs.length > 0 && mainTabs[0].title) {
             await this.nativeHost.showWindow(mainTabs[0].title);
-            console.log(`[TabFlow] Ensured main window is visible in taskbar`);
+            console.log('[TabFlow] Ensured main window is visible in taskbar');
           }
         } catch (showErr) {
           console.warn('[TabFlow] Could not ensure main window visibility:', showErr);
@@ -1005,9 +1090,6 @@ export class TabManager {
     }, 300);
   }
 
-  /**
-   * Cleans up the hidden window for a deleted workspace
-   */
   async cleanupHiddenWindow(workspaceId: string): Promise<void> {
     try {
       const map = await this.getHiddenWindowMap();

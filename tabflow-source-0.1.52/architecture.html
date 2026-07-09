@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TabFlow — System Architecture</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #232735;
+    --border: #2e3345;
+    --text: #e4e6ef;
+    --text-dim: #8b8fa3;
+    --accent: #6c8cff;
+    --accent2: #a78bfa;
+    --green: #4ade80;
+    --orange: #fb923c;
+    --red: #f87171;
+    --cyan: #22d3ee;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+  h1 { font-size: 2.4rem; font-weight: 700; margin-bottom: 8px; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .subtitle { color: var(--text-dim); font-size: 1.1rem; margin-bottom: 48px; }
+  h2 { font-size: 1.5rem; font-weight: 600; margin: 48px 0 20px; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  h3 { font-size: 1.15rem; font-weight: 600; margin: 28px 0 12px; color: var(--accent2); }
+  p { margin-bottom: 16px; color: var(--text); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 20px; }
+  .card-header { font-weight: 600; font-size: 1.1rem; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
+  .badge-blue { background: rgba(108,140,255,0.15); color: var(--accent); }
+  .badge-green { background: rgba(74,222,128,0.15); color: var(--green); }
+  .badge-orange { background: rgba(251,146,60,0.15); color: var(--orange); }
+  .badge-red { background: rgba(248,113,113,0.15); color: var(--red); }
+  .badge-cyan { background: rgba(34,211,238,0.15); color: var(--cyan); }
+
+  /* Architecture Diagram */
+  .arch-diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 32px; margin: 24px 0; overflow-x: auto; }
+  .arch-row { display: flex; gap: 16px; justify-content: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .arch-box { background: var(--surface2); border: 2px solid var(--border); border-radius: 10px; padding: 14px 20px; text-align: center; min-width: 140px; position: relative; }
+  .arch-box.highlight { border-color: var(--accent); box-shadow: 0 0 20px rgba(108,140,255,0.15); }
+  .arch-box.green { border-color: var(--green); }
+  .arch-box.orange { border-color: var(--orange); }
+  .arch-box.cyan { border-color: var(--cyan); }
+  .arch-box.purple { border-color: var(--accent2); }
+  .arch-box-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px; }
+  .arch-box-title { font-weight: 600; font-size: 0.95rem; }
+  .arch-arrow { text-align: center; color: var(--text-dim); font-size: 1.4rem; margin: 4px 0; }
+  .arch-arrow-h { color: var(--text-dim); font-size: 1.2rem; display: flex; align-items: center; }
+  .arch-group { background: rgba(108,140,255,0.05); border: 1px dashed var(--border); border-radius: 12px; padding: 16px; }
+  .arch-group-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px; font-weight: 600; }
+
+  /* Data Model */
+  .model-table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  .model-table th { background: var(--surface2); text-align: left; padding: 10px 14px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+  .model-table td { padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+  .model-table tr:last-child td { border-bottom: none; }
+  .type { color: var(--cyan); font-family: 'Fira Code', monospace; font-size: 0.85rem; }
+  .pk { color: var(--orange); font-weight: 600; }
+  .fk { color: var(--accent2); }
+
+  /* Timeline */
+  .timeline { position: relative; padding-left: 32px; }
+  .timeline::before { content: ''; position: absolute; left: 8px; top: 8px; bottom: 8px; width: 2px; background: var(--border); }
+  .timeline-item { position: relative; margin-bottom: 24px; }
+  .timeline-item::before { content: ''; position: absolute; left: -28px; top: 6px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--accent); background: var(--bg); }
+  .timeline-item.done::before { background: var(--green); border-color: var(--green); }
+  .timeline-phase { font-weight: 600; font-size: 0.85rem; color: var(--accent); margin-bottom: 4px; }
+  .timeline-title { font-weight: 600; margin-bottom: 4px; }
+  .timeline-desc { color: var(--text-dim); font-size: 0.9rem; }
+
+  /* Tech Stack Grid */
+  .tech-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin: 16px 0; }
+  .tech-item { background: var(--surface2); border-radius: 8px; padding: 14px; }
+  .tech-item-name { font-weight: 600; font-size: 0.95rem; margin-bottom: 4px; }
+  .tech-item-role { color: var(--text-dim); font-size: 0.85rem; }
+
+  /* Comparison Table */
+  .compare-table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.9rem; }
+  .compare-table th { background: var(--surface2); padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  .compare-table td { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .compare-table tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+  .yes { color: var(--green); }
+  .partial { color: var(--orange); }
+  .no { color: var(--red); }
+
+  code { background: var(--surface2); padding: 2px 8px; border-radius: 4px; font-family: 'Fira Code', monospace; font-size: 0.85rem; color: var(--cyan); }
+  .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin: 24px 0; }
+  .toc-title { font-weight: 600; margin-bottom: 12px; color: var(--text-dim); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; }
+  .toc a { color: var(--accent); text-decoration: none; display: block; padding: 4px 0; font-size: 0.95rem; }
+  .toc a:hover { text-decoration: underline; }
+  .callout { background: rgba(108,140,255,0.08); border-left: 3px solid var(--accent); padding: 16px 20px; border-radius: 0 8px 8px 0; margin: 16px 0; }
+  .callout-warn { background: rgba(251,146,60,0.08); border-left-color: var(--orange); }
+  .decision { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin: 16px 0; }
+  .decision-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .decision-q { font-weight: 600; }
+  .decision-a { color: var(--green); margin-top: 8px; }
+  .decision-why { color: var(--text-dim); font-size: 0.9rem; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>TabFlow</h1>
+<p class="subtitle">System Architecture for a Cross-Platform Browser Tab Manager</p>
+
+<div class="toc">
+  <div class="toc-title">Contents</div>
+  <a href="#overview">1. Overview &amp; Goals</a>
+  <a href="#architecture">2. System Architecture</a>
+  <a href="#data-model">3. Data Model</a>
+  <a href="#tech-stack">4. Technology Stack</a>
+  <a href="#platform">5. Platform Strategy</a>
+  <a href="#api">6. API Design</a>
+  <a href="#sync">7. Sync &amp; Conflict Resolution</a>
+  <a href="#decisions">8. Key Architecture Decisions</a>
+  <a href="#roadmap">9. Development Roadmap</a>
+  <a href="#risks">10. Risks &amp; Mitigations</a>
+</div>
+
+<!-- ============================== SECTION 1 ============================== -->
+<h2 id="overview">1. Overview &amp; Goals</h2>
+
+<p>TabFlow is a cross-platform browser tab manager that organizes tabs into workspaces, saves sessions, and syncs across all devices. Think of it as "Workona meets cross-platform sync."</p>
+
+<h3>Functional Requirements</h3>
+<div class="card">
+  <div class="card-header"><span class="badge badge-green">P0</span> Must-Have for MVP</div>
+  <p>Create, rename, and switch between named workspaces. Each workspace holds a set of tabs. Suspend/restore workspaces to free memory. Save sessions that persist across browser restarts. Cloud sync of workspaces across Chrome, Firefox, Edge, and Safari.</p>
+</div>
+<div class="card">
+  <div class="card-header"><span class="badge badge-blue">P1</span> Post-MVP</div>
+  <p>Tab search across all workspaces. Workspace templates (e.g., "Research" with predefined tabs). Usage analytics (most visited, time tracking). Shared workspaces for teams. iOS/iPadOS companion app.</p>
+</div>
+
+<h3>Non-Functional Requirements</h3>
+<div class="card">
+  <p><strong>Performance:</strong> Workspace switch &lt; 200ms locally, sync latency &lt; 2 seconds between devices.<br>
+  <strong>Storage:</strong> Support 50+ workspaces with 100+ tabs each without degradation.<br>
+  <strong>Availability:</strong> Offline-first &mdash; full functionality without internet, sync when reconnected.<br>
+  <strong>Privacy:</strong> URLs/titles encrypted at rest in the cloud. User owns their data.</p>
+</div>
+
+<!-- ============================== SECTION 2 ============================== -->
+<h2 id="architecture">2. System Architecture</h2>
+
+<div class="arch-diagram">
+  <div class="arch-group" style="margin-bottom: 20px;">
+    <div class="arch-group-label">Client Layer &mdash; Platform-Specific UI</div>
+    <div class="arch-row">
+      <div class="arch-box highlight">
+        <div class="arch-box-label">Chrome / Edge</div>
+        <div class="arch-box-title">MV3 Extension</div>
+      </div>
+      <div class="arch-box highlight">
+        <div class="arch-box-label">Firefox</div>
+        <div class="arch-box-title">MV3 Extension</div>
+      </div>
+      <div class="arch-box green">
+        <div class="arch-box-label">macOS Safari</div>
+        <div class="arch-box-title">Web Extension</div>
+      </div>
+      <div class="arch-box orange">
+        <div class="arch-box-label">iOS / iPadOS</div>
+        <div class="arch-box-title">React Native App</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="arch-arrow">&#9660;</div>
+
+  <div class="arch-group" style="margin-bottom: 20px;">
+    <div class="arch-group-label">Shared Core &mdash; TypeScript (runs in all clients)</div>
+    <div class="arch-row">
+      <div class="arch-box purple">
+        <div class="arch-box-label">Module</div>
+        <div class="arch-box-title">Workspace Engine</div>
+      </div>
+      <div class="arch-box purple">
+        <div class="arch-box-label">Module</div>
+        <div class="arch-box-title">Sync Client</div>
+      </div>
+      <div class="arch-box purple">
+        <div class="arch-box-label">Module</div>
+        <div class="arch-box-title">Storage Adapter</div>
+      </div>
+      <div class="arch-box purple">
+        <div class="arch-box-label">Module</div>
+        <div class="arch-box-title">Auth Manager</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="arch-arrow">&#9660;</div>
+
+  <div class="arch-group">
+    <div class="arch-group-label">Backend &mdash; Supabase (hosted PostgreSQL + Realtime)</div>
+    <div class="arch-row">
+      <div class="arch-box cyan">
+        <div class="arch-box-label">Service</div>
+        <div class="arch-box-title">Auth (OAuth)</div>
+      </div>
+      <div class="arch-box cyan">
+        <div class="arch-box-label">Database</div>
+        <div class="arch-box-title">PostgreSQL</div>
+      </div>
+      <div class="arch-box cyan">
+        <div class="arch-box-label">Realtime</div>
+        <div class="arch-box-title">WebSocket Sync</div>
+      </div>
+      <div class="arch-box cyan">
+        <div class="arch-box-label">Storage</div>
+        <div class="arch-box-title">Favicon Cache</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="callout">
+  <strong>Key Insight: Shared Core</strong><br>
+  The Workspace Engine, Sync Client, Storage Adapter, and Auth Manager are written in TypeScript as a shared npm package. Each platform (Chrome extension, Firefox extension, React Native app) imports this core and plugs in platform-specific adapters. This means ~70% of your logic is written once.
+</div>
+
+<!-- ============================== SECTION 3 ============================== -->
+<h2 id="data-model">3. Data Model</h2>
+
+<div class="card">
+  <div class="card-header">users</div>
+  <table class="model-table">
+    <tr><th>Column</th><th>Type</th><th>Notes</th></tr>
+    <tr><td><span class="pk">id</span></td><td><span class="type">uuid</span></td><td>Primary key (Supabase Auth)</td></tr>
+    <tr><td>email</td><td><span class="type">text</span></td><td>Login identifier</td></tr>
+    <tr><td>display_name</td><td><span class="type">text</span></td><td></td></tr>
+    <tr><td>created_at</td><td><span class="type">timestamptz</span></td><td></td></tr>
+    <tr><td>encryption_key_hash</td><td><span class="type">text</span></td><td>For E2E encrypted URLs</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-header">workspaces</div>
+  <table class="model-table">
+    <tr><th>Column</th><th>Type</th><th>Notes</th></tr>
+    <tr><td><span class="pk">id</span></td><td><span class="type">uuid</span></td><td>Primary key</td></tr>
+    <tr><td><span class="fk">user_id</span></td><td><span class="type">uuid</span></td><td>FK &rarr; users</td></tr>
+    <tr><td>name</td><td><span class="type">text</span></td><td>"Research", "Work", "Shopping"</td></tr>
+    <tr><td>color</td><td><span class="type">text</span></td><td>Hex color for visual grouping</td></tr>
+    <tr><td>icon</td><td><span class="type">text</span></td><td>Emoji or icon name</td></tr>
+    <tr><td>sort_order</td><td><span class="type">integer</span></td><td>Display ordering</td></tr>
+    <tr><td>is_active</td><td><span class="type">boolean</span></td><td>Currently open workspace</td></tr>
+    <tr><td>updated_at</td><td><span class="type">timestamptz</span></td><td>For conflict resolution (last-write-wins)</td></tr>
+    <tr><td>version</td><td><span class="type">integer</span></td><td>Optimistic concurrency</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-header">tabs</div>
+  <table class="model-table">
+    <tr><th>Column</th><th>Type</th><th>Notes</th></tr>
+    <tr><td><span class="pk">id</span></td><td><span class="type">uuid</span></td><td>Primary key</td></tr>
+    <tr><td><span class="fk">workspace_id</span></td><td><span class="type">uuid</span></td><td>FK &rarr; workspaces</td></tr>
+    <tr><td>url</td><td><span class="type">text</span></td><td>Encrypted at rest</td></tr>
+    <tr><td>title</td><td><span class="type">text</span></td><td>Page title</td></tr>
+    <tr><td>favicon_url</td><td><span class="type">text</span></td><td></td></tr>
+    <tr><td>sort_order</td><td><span class="type">integer</span></td><td>Position within workspace</td></tr>
+    <tr><td>is_pinned</td><td><span class="type">boolean</span></td><td></td></tr>
+    <tr><td>last_accessed</td><td><span class="type">timestamptz</span></td><td>For "recently used" sorting</td></tr>
+    <tr><td>updated_at</td><td><span class="type">timestamptz</span></td><td></td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-header">sessions (saved snapshots)</div>
+  <table class="model-table">
+    <tr><th>Column</th><th>Type</th><th>Notes</th></tr>
+    <tr><td><span class="pk">id</span></td><td><span class="type">uuid</span></td><td>Primary key</td></tr>
+    <tr><td><span class="fk">user_id</span></td><td><span class="type">uuid</span></td><td>FK &rarr; users</td></tr>
+    <tr><td>name</td><td><span class="type">text</span></td><td>"Friday afternoon state"</td></tr>
+    <tr><td>snapshot</td><td><span class="type">jsonb</span></td><td>Full workspace + tab state</td></tr>
+    <tr><td>created_at</td><td><span class="type">timestamptz</span></td><td></td></tr>
+  </table>
+</div>
+
+<!-- ============================== SECTION 4 ============================== -->
+<h2 id="tech-stack">4. Technology Stack</h2>
+
+<div class="tech-grid">
+  <div class="tech-item">
+    <div class="tech-item-name">TypeScript</div>
+    <div class="tech-item-role">Shared core + all clients</div>
+  </div>
+  <div class="tech-item">
+    <div class="tech-item-name">React</div>
+    <div class="tech-item-role">Extension popup/sidebar UI</div>
+  </div>
+  <div class="tech-item">
+    <div class="tech-item-name">React Native</div>
+    <div class="tech-item-role">iOS/iPadOS companion app</div>
+  </div>
+  <div class="tech-item">
+    <div class="tech-item-name">Supabase</div>
+    <div class="tech-item-role">Auth, DB, Realtime sync</div>
+  </div>
+  <div class="tech-item">
+    <div class="tech-item-name">PostgreSQL</div>
+    <div class="tech-item-role">Primary data store</div>
+  </div>
+  <div class="tech-item">
+    <div class="tech-item-name">WebExtensions API</div>
+    <div class="tech-item-role">Chrome, Firefox, Edge, Safari</div>
+  </div>
+  <div class="tech-item">
+    <div class="tech-item-name">IndexedDB</div>
+    <div class="tech-item-role">Local offline storage</div>
+  </div>
+  <div class="tech-item">
+    <div class="tech-item-name">Tailwind CSS</div>
+    <div class="tech-item-role">UI styling (all platforms)</div>
+  </div>
+</div>
+
+<!-- ============================== SECTION 5 ============================== -->
+<h2 id="platform">5. Platform Strategy</h2>
+
+<table class="compare-table">
+  <tr>
+    <th>Platform</th>
+    <th>Approach</th>
+    <th>Tab API</th>
+    <th>Tab Groups</th>
+    <th>Sync</th>
+    <th>Priority</th>
+  </tr>
+  <tr>
+    <td><strong>Chrome / Edge</strong></td>
+    <td>MV3 Extension</td>
+    <td class="yes">Full</td>
+    <td class="yes">chrome.tabGroups</td>
+    <td class="yes">Full</td>
+    <td><span class="badge badge-green">Phase 1</span></td>
+  </tr>
+  <tr>
+    <td><strong>Firefox</strong></td>
+    <td>MV3 Extension</td>
+    <td class="yes">Full</td>
+    <td class="partial">No native groups</td>
+    <td class="yes">Full</td>
+    <td><span class="badge badge-green">Phase 1</span></td>
+  </tr>
+  <tr>
+    <td><strong>Safari (macOS)</strong></td>
+    <td>Web Extension + App wrapper</td>
+    <td class="partial">Most APIs</td>
+    <td class="partial">Tab Groups (limited)</td>
+    <td class="yes">Full</td>
+    <td><span class="badge badge-blue">Phase 2</span></td>
+  </tr>
+  <tr>
+    <td><strong>iOS / iPadOS</strong></td>
+    <td>React Native app</td>
+    <td class="no">Read-only</td>
+    <td class="no">N/A</td>
+    <td class="yes">Full</td>
+    <td><span class="badge badge-orange">Phase 3</span></td>
+  </tr>
+</table>
+
+<div class="callout callout-warn">
+  <strong>Why React Native for mobile instead of a Safari extension?</strong><br>
+  iOS Safari extensions cannot manage windows, have very limited tab control, and must be packaged inside a native app anyway. A React Native app gives full control over the UX, native push notifications for workspace changes, deep linking to open tabs in Safari, and a proper App Store presence. This mirrors Workona's approach.
+</div>
+
+<!-- ============================== SECTION 6 ============================== -->
+<h2 id="api">6. API Design</h2>
+
+<p>Supabase provides auto-generated REST and Realtime APIs from the database schema. Key endpoints:</p>
+
+<div class="card">
+  <div class="card-header">Workspace Operations</div>
+  <table class="model-table">
+    <tr><th>Operation</th><th>Method</th><th>Notes</th></tr>
+    <tr><td>List workspaces</td><td><code>GET /workspaces?user_id=eq.{id}</code></td><td>Ordered by sort_order</td></tr>
+    <tr><td>Create workspace</td><td><code>POST /workspaces</code></td><td>Returns new workspace with generated ID</td></tr>
+    <tr><td>Update workspace</td><td><code>PATCH /workspaces?id=eq.{id}</code></td><td>Includes version check for conflicts</td></tr>
+    <tr><td>Delete workspace</td><td><code>DELETE /workspaces?id=eq.{id}</code></td><td>Cascades to tabs</td></tr>
+    <tr><td>Get workspace tabs</td><td><code>GET /tabs?workspace_id=eq.{id}</code></td><td>Ordered by sort_order</td></tr>
+    <tr><td>Batch update tabs</td><td><code>POST /rpc/batch_update_tabs</code></td><td>Custom function for bulk moves</td></tr>
+    <tr><td>Save session</td><td><code>POST /sessions</code></td><td>Snapshot of current state as JSONB</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <div class="card-header">Realtime Subscriptions</div>
+  <p>Each client subscribes to changes on their workspaces and tabs via Supabase Realtime channels. Changes made on one device propagate to all others within ~1&ndash;2 seconds.</p>
+  <table class="model-table">
+    <tr><th>Channel</th><th>Filter</th><th>Events</th></tr>
+    <tr><td><code>workspaces:{user_id}</code></td><td>user_id = current user</td><td>INSERT, UPDATE, DELETE</td></tr>
+    <tr><td><code>tabs:{user_id}</code></td><td>workspace.user_id = current user</td><td>INSERT, UPDATE, DELETE</td></tr>
+  </table>
+</div>
+
+<!-- ============================== SECTION 7 ============================== -->
+<h2 id="sync">7. Sync &amp; Conflict Resolution</h2>
+
+<div class="card">
+  <div class="card-header">Offline-First Architecture</div>
+  <p>All operations write to local IndexedDB first, then sync to Supabase when online. This ensures the extension works perfectly without internet and feels instant.</p>
+  <p><strong>Sync flow:</strong> User action &rarr; write to IndexedDB &rarr; update UI immediately &rarr; push to Supabase in background &rarr; Supabase broadcasts to other devices via Realtime &rarr; other devices update IndexedDB + UI.</p>
+</div>
+
+<div class="card">
+  <div class="card-header">Conflict Resolution Strategy</div>
+  <p><strong>Last-Write-Wins (LWW)</strong> with field-level merging. Each record has an <code>updated_at</code> timestamp and a <code>version</code> counter. When two devices edit the same workspace:</p>
+  <p>1. If they edited different fields (e.g., one renamed it, another changed its color), merge both changes.</p>
+  <p>2. If they edited the same field, the later <code>updated_at</code> wins.</p>
+  <p>3. Tab ordering conflicts use the version counter &mdash; higher version wins.</p>
+  <p>This is simple, predictable, and good enough for a personal tab manager. Team/shared workspaces (P1) would need operational transforms or CRDTs.</p>
+</div>
+
+<!-- ============================== SECTION 8 ============================== -->
+<h2 id="decisions">8. Key Architecture Decisions</h2>
+
+<div class="decision">
+  <div class="decision-header"><span class="badge badge-blue">ADR-1</span> <span class="decision-q">Why Supabase over Firebase?</span></div>
+  <div class="decision-a">Decision: Supabase (PostgreSQL)</div>
+  <div class="decision-why">PostgreSQL gives relational modeling (workspaces have tabs), flexible querying, and schema evolution via migrations. Supabase's Realtime is built on PostgreSQL LISTEN/NOTIFY with lower latency than Firestore. Open-source with predictable pricing and self-hosting option for the future. Firebase's Firestore document model would require denormalization and makes querying across workspaces harder.</div>
+</div>
+
+<div class="decision">
+  <div class="decision-header"><span class="badge badge-blue">ADR-2</span> <span class="decision-q">Why a shared TypeScript core?</span></div>
+  <div class="decision-a">Decision: Monorepo with shared <code>@tabflow/core</code> package</div>
+  <div class="decision-why">Writing workspace logic, sync, and storage once and importing it across Chrome, Firefox, Safari, and React Native reduces bugs and development time by ~60%. Platform differences are handled by adapter interfaces (e.g., <code>StorageAdapter</code> wraps IndexedDB on extensions and AsyncStorage on React Native).</div>
+</div>
+
+<div class="decision">
+  <div class="decision-header"><span class="badge badge-blue">ADR-3</span> <span class="decision-q">Why React Native for mobile instead of PWA?</span></div>
+  <div class="decision-a">Decision: React Native</div>
+  <div class="decision-why">PWAs on iOS lack background sync, push notifications, and App Store distribution. Safari extension on iOS has no window management. React Native provides native UX, push notifications for workspace changes, App Store presence, and shares React knowledge with the extension UI. Flutter was considered but React alignment gives better code sharing with the extension popups.</div>
+</div>
+
+<div class="decision">
+  <div class="decision-header"><span class="badge badge-blue">ADR-4</span> <span class="decision-q">Why IndexedDB for local storage?</span></div>
+  <div class="decision-a">Decision: IndexedDB (via Dexie.js wrapper)</div>
+  <div class="decision-why"><code>chrome.storage.local</code> has a 10MB limit and is synchronous in MV3 service workers. IndexedDB supports unlimited storage, async access, and indexed queries. Dexie.js provides a clean Promise-based API. On React Native, AsyncStorage serves the same role through the StorageAdapter interface.</div>
+</div>
+
+<!-- ============================== SECTION 9 ============================== -->
+<h2 id="roadmap">9. Development Roadmap</h2>
+
+<div class="timeline">
+  <div class="timeline-item">
+    <div class="timeline-phase">Phase 1 &mdash; Weeks 1&ndash;4</div>
+    <div class="timeline-title">Chrome Extension + Local Storage</div>
+    <div class="timeline-desc">Set up monorepo. Build the shared core (workspace engine, storage adapter). Create Chrome MV3 extension with sidebar UI. Local-only &mdash; no cloud sync yet. Workspaces, tabs, save/restore sessions.</div>
+  </div>
+  <div class="timeline-item">
+    <div class="timeline-phase">Phase 2 &mdash; Weeks 5&ndash;8</div>
+    <div class="timeline-title">Cloud Sync + Firefox</div>
+    <div class="timeline-desc">Set up Supabase project (auth, database, realtime). Build sync client in the shared core. Add user auth (Google OAuth via Supabase). Port to Firefox using WebExtensions compatibility. Offline-first with background sync.</div>
+  </div>
+  <div class="timeline-item">
+    <div class="timeline-phase">Phase 3 &mdash; Weeks 9&ndash;12</div>
+    <div class="timeline-title">Safari + Polish</div>
+    <div class="timeline-desc">Build Safari Web Extension using Xcode converter tool. Handle Safari API differences via adapter. Add tab search, workspace templates, keyboard shortcuts. Performance optimization and testing.</div>
+  </div>
+  <div class="timeline-item">
+    <div class="timeline-phase">Phase 4 &mdash; Weeks 13&ndash;16</div>
+    <div class="timeline-title">React Native Mobile App</div>
+    <div class="timeline-desc">Build iOS/iPadOS companion app. Workspace browsing, session management, deep links to open tabs in Safari. Push notifications for workspace changes. App Store submission.</div>
+  </div>
+</div>
+
+<!-- ============================== SECTION 10 ============================== -->
+<h2 id="risks">10. Risks &amp; Mitigations</h2>
+
+<div class="card">
+  <div class="card-header"><span class="badge badge-red">High</span> Manifest V3 Service Worker Limits</div>
+  <p>MV3 service workers terminate after 30 seconds of inactivity. Tab monitoring must use event-driven patterns (<code>chrome.tabs.onUpdated</code>, <code>chrome.tabs.onRemoved</code>) rather than polling. Mitigation: design all background logic as event handlers, use alarms API for periodic sync.</p>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="badge badge-orange">Medium</span> Safari API Gaps</div>
+  <p>Safari's WebExtensions implementation lags Chrome. Some APIs (like <code>tabGroups</code>) may behave differently or not exist. Mitigation: build a browser capability detector in the shared core that gracefully degrades features per platform.</p>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="badge badge-orange">Medium</span> Sync Conflicts at Scale</div>
+  <p>Last-write-wins is simple but could lose data if a user rapidly switches between devices. Mitigation: implement a sync queue with version checking. For MVP this is acceptable; revisit with CRDTs if team workspaces ship.</p>
+</div>
+
+<div class="card">
+  <div class="card-header"><span class="badge badge-blue">Low</span> Store Review for Safari/iOS</div>
+  <p>Apple's review process can reject extensions. Mitigation: follow Apple's Human Interface Guidelines from the start, include proper privacy labels, and test on actual devices before submission.</p>
+</div>
+
+<div style="margin-top: 48px; padding-top: 24px; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 0.85rem;">
+  TabFlow Architecture Document &mdash; Version 1.0 &mdash; April 2026
+</div>
+
+</div>
+</body>
+</html>

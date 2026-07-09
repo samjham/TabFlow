@@ -1,0 +1,9 @@
+{
+  "name": "com.tabflow.host",
+  "description": "TabFlow Native Messaging Host — hides workspace windows from Windows taskbar",
+  "path": "C:\\TabFlow\\TabFlowHost.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://YOUR_EXTENSION_ID_HERE/"
+  ]
+}

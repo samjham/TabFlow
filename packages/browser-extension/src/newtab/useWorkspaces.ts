@@ -35,7 +35,7 @@ export interface UseWorkspacesReturn {
   error: string | null;
   createWorkspace: (name: string, color: string) => Promise<void>;
   deleteWorkspace: (workspaceId: string) => Promise<void>;
-  switchWorkspace: (workspaceId: string) => Promise<void>;
+  switchWorkspace: (workspaceId: string, preserveIds?: string[]) => Promise<void>;
   renameWorkspace: (workspaceId: string, name: string) => Promise<void>;
   changeWorkspaceColor: (workspaceId: string, color: string) => Promise<void>;
   reorderWorkspaces: (orderedIds: string[]) => Promise<void>;
@@ -49,6 +49,7 @@ export interface UseWorkspacesReturn {
   searchAllWorkspaces: (query: string) => Promise<SearchResult[]>;
   closeAllTabs: (workspaceId: string) => Promise<void>;
   reorderTabs: (orderedTabIds: string[]) => Promise<void>;
+  toggleTabPersistent: (tabId: string, persistent: boolean) => Promise<void>;
   getDeletedWorkspaces: () => Promise<DeletedWorkspace[]>;
   restoreDeletedWorkspaces: (archiveIds: string[]) => Promise<void>;
   permanentlyDeleteWorkspaces: (archiveIds: string[]) => Promise<void>;
@@ -190,9 +191,15 @@ export function useWorkspaces(): UseWorkspacesReturn {
   );
 
   const switchWorkspace = useCallback(
-    async (workspaceId: string) => {
+    async (workspaceId: string, preserveIds?: string[]) => {
       try {
-        await sendMessage(MessageType.SWITCH_WORKSPACE, { workspaceId });
+        // 0.1.57: preserveIds is the set of storageIds the user selected
+        // in the pre-switch prompt modal. Undefined means the modal
+        // wasn't shown (no audible or persistent-flagged tabs in the
+        // current workspace) so DB flags are left alone.
+        const payload: any = { workspaceId };
+        if (preserveIds !== undefined) payload.preserveIds = preserveIds;
+        await sendMessage(MessageType.SWITCH_WORKSPACE, payload);
         await refresh();
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to switch workspace');
@@ -382,6 +389,34 @@ export function useWorkspaces(): UseWorkspacesReturn {
     [refresh]
   );
 
+  const toggleTabPersistent = useCallback(
+    async (tabId: string, persistent: boolean) => {
+      // Optimistic UI update — flip the flag in local state immediately
+      // so the checkbox visibly toggles without waiting for the SW round-trip.
+      setTabs((prev) =>
+        prev.map((t) => (t.id === tabId ? { ...t, persistent } : t))
+      );
+      try {
+        // 0.1.53: Pass workspaceId so the SW's handler can do a direct
+        // lookup instead of iterating all workspaces. Turns the toggle
+        // from a ~1s operation (Sam's 19-workspace install) into a
+        // ~10ms operation, closing the race window against a concurrent
+        // workspace switch's snapshot.
+        await sendMessage(MessageType.TOGGLE_TAB_PERSISTENT, {
+          tabId,
+          persistent,
+          workspaceId: activeWorkspace?.id,
+        });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to toggle tab persistent');
+        // On failure, refresh from truth so the checkbox reflects storage.
+        await refresh();
+        throw err;
+      }
+    },
+    [refresh, activeWorkspace?.id]
+  );
+
   const getDeletedWorkspaces = useCallback(
     async (): Promise<DeletedWorkspace[]> => {
       try {
@@ -440,6 +475,7 @@ export function useWorkspaces(): UseWorkspacesReturn {
     restoreHistoryEntry,
     searchAllWorkspaces,
     reorderTabs,
+    toggleTabPersistent,
     getDeletedWorkspaces,
     restoreDeletedWorkspaces,
     permanentlyDeleteWorkspaces,

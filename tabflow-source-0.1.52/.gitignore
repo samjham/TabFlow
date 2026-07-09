@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.local
+.test-profile/
+
+# Build artifacts
+*.zip
+packages/native-host/bin/
+packages/native-host/obj/
+
+# Vite temp files
+*.timestamp-*

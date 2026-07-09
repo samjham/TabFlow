@@ -8,10 +8,12 @@
  */
 
 import { WorkspaceEngine } from '@tabflow/core';
-import type { Workspace, Tab, StorageAdapter } from '@tabflow/core';
+import type { Workspace, Tab, StorageAdapter, DeletedWorkspace } from '@tabflow/core';
 import { TabManager } from './TabManager';
-import { getExtensionBaseUrl } from '../browser-compat';
+import { getExtensionBaseUrl, getExtensionPageUrl, isFirefox } from '../browser-compat';
 import { canonicalizeUrl } from '../utils/tabId';
+import { runSystemOperation } from './SystemOperationGate';
+import { getHiddenTabsMap, setHiddenTab, clearHiddenTab } from './HiddenTabsMap';
 
 /** The local user ID (single-user for now, auth comes later) */
 const LOCAL_USER_ID = 'local-user';
@@ -48,6 +50,14 @@ export enum MessageType {
   GET_DELETED_WORKSPACES = 'GET_DELETED_WORKSPACES',
   RESTORE_DELETED_WORKSPACES = 'RESTORE_DELETED_WORKSPACES',
   PERMANENTLY_DELETE_WORKSPACES = 'PERMANENTLY_DELETE_WORKSPACES',
+  GET_OPERATION_STATUS = 'GET_OPERATION_STATUS',
+  GET_DIAGNOSTIC_LOG = 'GET_DIAGNOSTIC_LOG',
+  CLEAR_DIAGNOSTIC_LOG = 'CLEAR_DIAGNOSTIC_LOG',
+  GET_DIAGNOSTIC_REPORT = 'GET_DIAGNOSTIC_REPORT',
+  TOGGLE_TAB_PERSISTENT = 'TOGGLE_TAB_PERSISTENT',
+  GET_TABS_TO_PROMPT_FOR_SWITCH = 'GET_TABS_TO_PROMPT_FOR_SWITCH',
+  FORCE_PUSH_TO_CLOUD = 'FORCE_PUSH_TO_CLOUD',
+  FORCE_PULL_FROM_CLOUD = 'FORCE_PULL_FROM_CLOUD',
 }
 
 /**
@@ -78,6 +88,48 @@ export class MessageHandler {
   private onSwitchingWorkspacesChange?: (value: boolean) => void;
 
   /**
+   * Phase 2 (gate-hardening): callback the service worker provides for
+   * the "final reconcile" step at the end of each system operation. The
+   * MessageHandler can't call the service-worker-local `finalReconcile`
+   * directly (different module, no import without a cycle), so the SW
+   * passes it down via the constructor. Optional so tests / standalone
+   * use of MessageHandler don't need it.
+   */
+  private onFinalReconcile?: (workspaceId: string, operationName: string) => Promise<void>;
+
+  /**
+   * 0.1.34: Optional callback invoked at the END of a workspace switch,
+   * INSIDE the runSystemOperation wrapper (after finalReconcile, before
+   * the gate clears). The blocking loading modal stays up because the
+   * gate is still set; user clicks can't race the backfill's tab
+   * activations. Awaited — the switch operation does not complete until
+   * backfill returns. Failures are logged and swallowed (non-fatal).
+   * MessageHandler can't reach SW-local backfillThumbnails directly
+   * without a circular import, so the SW passes this callback down.
+   */
+  private onPostOperationBackfill?: (workspaceId: string) => Promise<void>;
+
+  /**
+   * 0.1.37: Cross-device sync callbacks for the archive (recycle bin).
+   * The service worker owns syncClient, so MessageHandler can't push to
+   * the cloud directly without a circular import. These callbacks are
+   * passed in from the SW; each one no-ops if the SW didn't pass it,
+   * is not the active device, or sync isn't initialised. Failures are
+   * swallowed at the call site so local writes are never blocked by a
+   * cloud hiccup.
+   */
+  private onPushDeletedWorkspaceToCloud?: (entry: DeletedWorkspace) => Promise<void>;
+  private onPushRestoredWorkspaceToCloud?: (archiveId: string) => Promise<void>;
+
+  /**
+   * 0.1.44: Diagnostic log callback. The SW owns the DiagnosticLog
+   * module and passes this callback down so MessageHandler can record
+   * events (e.g. workspace-switch progress) into the rolling buffer
+   * without a circular import. No-op when the SW didn't wire it in.
+   */
+  onDiagnostic?: (category: string, message: string, data?: any) => Promise<void>;
+
+  /**
    * When true, the next workspace switch will NOT save the outgoing
    * workspace's tabs. This is set after Chrome restart because we can't
    * trust which tabs Chrome restored into the main window — they may
@@ -85,11 +137,26 @@ export class MessageHandler {
    */
   private skipOutgoingSaveOnNextSwitch = false;
 
-  constructor(storage: StorageAdapter, onSwitchingWorkspacesChange?: (value: boolean) => void, tabManager?: TabManager) {
+  constructor(
+    storage: StorageAdapter,
+    onSwitchingWorkspacesChange?: (value: boolean) => void,
+    tabManager?: TabManager,
+    onFinalReconcile?: (workspaceId: string, operationName: string) => Promise<void>,
+    onPostOperationBackfill?: (workspaceId: string) => Promise<void>,
+    onPushDeletedWorkspaceToCloud?: (entry: DeletedWorkspace) => Promise<void>,
+    onPushRestoredWorkspaceToCloud?: (archiveId: string) => Promise<void>,
+    _unusedOnCheckPipActive?: unknown, // 0.1.52: kept for positional compat, ignored
+    onDiagnostic?: (category: string, message: string, data?: any) => Promise<void>,
+  ) {
     this.storage = storage;
     this.engine = new WorkspaceEngine(storage);
     this.tabManager = tabManager || new TabManager();
     this.onSwitchingWorkspacesChange = onSwitchingWorkspacesChange;
+    this.onFinalReconcile = onFinalReconcile;
+    this.onPostOperationBackfill = onPostOperationBackfill;
+    this.onPushDeletedWorkspaceToCloud = onPushDeletedWorkspaceToCloud;
+    this.onPushRestoredWorkspaceToCloud = onPushRestoredWorkspaceToCloud;
+    this.onDiagnostic = onDiagnostic;
   }
 
   /**
@@ -157,6 +224,10 @@ export class MessageHandler {
           return await this.handleGetDeletedWorkspaces();
         case MessageType.RESTORE_DELETED_WORKSPACES:
           return await this.handleRestoreDeletedWorkspaces(message.payload);
+        case MessageType.TOGGLE_TAB_PERSISTENT:
+          return await this.handleToggleTabPersistent(message.payload);
+        case MessageType.GET_TABS_TO_PROMPT_FOR_SWITCH:
+          return await this.handleGetTabsToPromptForSwitch();
         case MessageType.PERMANENTLY_DELETE_WORKSPACES:
           return await this.handlePermanentlyDeleteWorkspaces(message.payload);
         default:
@@ -268,6 +339,16 @@ export class MessageHandler {
       };
       await (this.storage as any).archiveWorkspace(archiveEntry);
       console.log(`[TabFlow] Archived workspace ${workspaceId} to recycle bin`);
+
+      // 0.1.37: push the archive entry to Supabase so the recycle bin
+      // follows the user across devices. The SW callback no-ops if we
+      // aren't the active device or aren't safe to push. Fire-and-forget
+      // — a cloud failure can't block the local delete.
+      try {
+        await this.onPushDeletedWorkspaceToCloud?.(archiveEntry as DeletedWorkspace);
+      } catch (cloudErr) {
+        console.warn('[TabFlow] Failed to push archive to cloud (non-fatal):', cloudErr);
+      }
     } catch (err) {
       console.warn('[TabFlow] Failed to archive workspace (proceeding with delete):', err);
     }
@@ -377,6 +458,152 @@ export class MessageHandler {
 
     console.log(`[TabFlow] Removed tab ${tabId}`);
     return { success: true, data: { removedTabId: tabId } };
+  }
+
+  /**
+   * 0.1.57: Return tabs in the current active workspace that should be
+   * shown in the pre-switch prompt modal — the union of:
+   *   - tabs currently playing audio (`audible: true`)
+   *   - tabs whose DB record has `persistent: true`
+   *
+   * Called by the newtab UI BEFORE dispatching SWITCH_WORKSPACE. If this
+   * returns an empty array, the UI proceeds directly to the switch (no
+   * modal). Otherwise the UI shows a modal with checkboxes and passes the
+   * chosen `preserveIds` back in the SWITCH_WORKSPACE payload.
+   */
+  private async handleGetTabsToPromptForSwitch(): Promise<Response> {
+    try {
+      const workspaces = await this.engine.getWorkspaces(LOCAL_USER_ID);
+      const active = workspaces.find((ws) => ws.isActive);
+      if (!active) {
+        return { success: true, data: { tabs: [] } };
+      }
+
+      const dbTabs = await this.storage.getTabs(active.id);
+      const dbByCanonUrl = new Map<string, Tab[]>();
+      for (const t of dbTabs) {
+        const key = canonicalizeUrl(t.url);
+        const list = dbByCanonUrl.get(key) || [];
+        list.push(t);
+        dbByCanonUrl.set(key, list);
+      }
+
+      const mainWindowId = await this.tabManager.getMainWindowId();
+      if (mainWindowId === undefined) {
+        return { success: true, data: { tabs: [] } };
+      }
+      const chromeTabs = await chrome.tabs.query({ windowId: mainWindowId });
+      const tfStored = await chrome.storage.local.get('tabFlowTabId');
+      const tfId = tfStored?.tabFlowTabId;
+
+      // Build the union: audible OR persistent-flagged.
+      // We iterate live Chrome tabs to catch audible ones (which are only
+      // meaningful at runtime), then also iterate DB records to catch
+      // persistent-flagged tabs (which may not be audible right now — e.g.
+      // a paused PIP video).
+      const includedStorageIds = new Set<string>();
+      const results: Array<{
+        storageId: string;
+        url: string;
+        title: string;
+        faviconUrl?: string;
+        audible: boolean;
+        persistent: boolean;
+      }> = [];
+
+      // Pass 1: audible live tabs
+      for (const t of chromeTabs) {
+        if (t.id === undefined || t.id === tfId || t.hidden) continue;
+        if (!t.audible) continue;
+        const realUrl = this.tabManager.getRealUrl(t.url || '');
+        const canon = canonicalizeUrl(realUrl);
+        const bucket = dbByCanonUrl.get(canon);
+        const rec = bucket && bucket.length > 0 ? bucket[0] : null;
+        if (!rec) continue;
+        if (includedStorageIds.has(rec.id)) continue;
+        includedStorageIds.add(rec.id);
+        results.push({
+          storageId: rec.id,
+          url: rec.url,
+          title: rec.title || t.title || rec.url,
+          faviconUrl: rec.faviconUrl,
+          audible: true,
+          persistent: !!rec.persistent,
+        });
+      }
+
+      // Pass 2: persistent-flagged DB records that we didn't already add
+      for (const rec of dbTabs) {
+        if (!rec.persistent) continue;
+        if (includedStorageIds.has(rec.id)) continue;
+        includedStorageIds.add(rec.id);
+        results.push({
+          storageId: rec.id,
+          url: rec.url,
+          title: rec.title || rec.url,
+          faviconUrl: rec.faviconUrl,
+          audible: false,
+          persistent: true,
+        });
+      }
+
+      return { success: true, data: { tabs: results } };
+    } catch (err) {
+      console.error('[TabFlow] handleGetTabsToPromptForSwitch failed:', err);
+      return { success: false, error: String(err) };
+    }
+  }
+
+  /**
+   * 0.1.46: Toggle the `persistent` flag on a tab record.
+   *
+   * The flag controls whether the tab is hidden (via `chrome.tabs.hide()`)
+   * or closed when the user switches away from the tab's workspace. Only
+   * useful on Firefox — Chrome's WebExtensions API doesn't expose `.hide()`,
+   * so the flag is a no-op there. The UI hides / disables the checkbox on
+   * Chrome builds to prevent users from setting it.
+   *
+   * The change is written to local storage; cross-device sync happens on
+   * the next snapshot push (the flag is included in `pushTab`'s upsert
+   * payload as of 0.1.46).
+   */
+  private async handleToggleTabPersistent(payload: any): Promise<Response> {
+    const { tabId, persistent } = payload || {};
+    if (!tabId) return { success: false, error: 'tabId is required' };
+    if (typeof persistent !== 'boolean') {
+      return { success: false, error: 'persistent must be boolean' };
+    }
+
+    // Find the tab record across all workspaces (the payload doesn't carry
+    // workspaceId, and IndexedDB doesn't have a global by-id lookup).
+    const workspaces = await this.storage.getWorkspaces(LOCAL_USER_ID);
+    let target: Tab | null = null;
+    for (const ws of workspaces) {
+      const wsTabs = await this.storage.getTabs(ws.id);
+      const found = wsTabs.find((t) => t.id === tabId);
+      if (found) {
+        target = found;
+        break;
+      }
+    }
+    if (!target) {
+      return { success: false, error: 'tab not found' };
+    }
+
+    const updated: Tab = {
+      ...target,
+      persistent,
+      updatedAt: new Date(),
+    };
+    await this.storage.saveTab(updated);
+
+    void this.onDiagnostic?.('user-action', 'tab persistent toggled', {
+      tabId,
+      persistent,
+    });
+
+    console.log(`[TabFlow] Tab ${tabId} persistent = ${persistent}`);
+    return { success: true };
   }
 
   /**
@@ -592,11 +819,38 @@ export class MessageHandler {
    * and all other DOM state across workspace switches.
    */
   private async handleSwitchWorkspace(payload: any): Promise<Response> {
-    const { workspaceId } = payload || {};
+    const { workspaceId, preserveIds } = payload || {};
     if (!workspaceId) return { success: false, error: 'workspaceId is required' };
 
+    // 0.1.57: preserveIds is the set of storageIds the user checked in
+    // the pre-switch prompt modal. It authoritatively decides the
+    // persistent flag for each tab in the CURRENT active workspace:
+    //   - IDs in preserveIds → persistent=true (will be hidden on switch)
+    //   - IDs NOT in preserveIds → persistent=false (will be closed)
+    // Undefined preserveIds means the UI didn't show the modal (no
+    // audible/persistent tabs) — we leave DB flags alone.
+    if (Array.isArray(preserveIds)) {
+      try {
+        const preserveSet = new Set<string>(preserveIds);
+        const activeWs = (await this.engine.getWorkspaces(LOCAL_USER_ID)).find((ws) => ws.isActive);
+        if (activeWs) {
+          const activeTabs = await this.storage.getTabs(activeWs.id);
+          for (const rec of activeTabs) {
+            const want = preserveSet.has(rec.id);
+            if (!!rec.persistent !== want) {
+              await this.storage.saveTab({ ...rec, persistent: want, updatedAt: new Date() });
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[TabFlow] applying preserveIds failed:', err);
+      }
+    }
+
+    const result = await runSystemOperation('handleSwitchWorkspace', async () => {
     try {
       console.log(`[TabFlow] Starting workspace switch to ${workspaceId}`);
+      this.onDiagnostic?.('workspace-switch', 'starting', { targetId: workspaceId });
 
       // Signal to service worker that we're switching workspaces
       this.onSwitchingWorkspacesChange?.(true);
@@ -659,29 +913,173 @@ export class MessageHandler {
         await this.storage.saveWorkspace(targetWorkspace);
         console.log(`[TabFlow] Workspace ${workspaceId} is now active`);
 
-        // Step 4: Move current tabs to a hidden window (preserves state)
+        // Step 4: Decide how to handle the outgoing workspace's tabs.
         // EXCEPTION: After Chrome restart, DON'T move to hidden window — the
         // tabs in the main window may not belong to the outgoing workspace.
         // Just close them so they don't pollute future switches.
+        //
+        // 0.1.38: PIP-awareness. The hidden-window mechanism was created
+        // to preserve Picture-in-Picture across workspace switches (closing
+        // a tab destroys its <video>, which kills PIP). But hidden windows
+        // are persistent — they keep Firefox alive as a background process
+        // even after the user clicks X on the visible window. So we now
+        // only create a hidden window when at least one outgoing tab
+        // actually has active PIP. The common case (no PIP) just closes
+        // the outgoing tabs normally, so Firefox can exit cleanly when
+        // the user closes the visible window.
         if (currentActiveWorkspace) {
           if (isPostRestartSwitch) {
             console.log(`[TabFlow] Post-restart: closing orphan tabs instead of hiding (they may not belong to ${currentActiveWorkspace.id})`);
             await this.tabManager.closeAllTabs();
           } else {
-            const moved = await this.tabManager.moveTabsToHiddenWindow(currentActiveWorkspace.id);
-            if (!moved) {
-              console.warn('[TabFlow] Hidden window move failed, falling back to close');
-              try {
-                const checkWindow = await chrome.windows.get(mainWindowId);
-                if (checkWindow) {
-                  await this.tabManager.closeAllTabs();
-                } else {
-                  console.error('[TabFlow] Main window no longer exists after failed move');
+            // 0.1.46: Persistent-tab-aware outgoing handling.
+            //
+            // The 0.1.38 PIP-aware `moveTabsToHiddenWindow` path is gone —
+            // Firefox's PIP is invisible to WebExtensions APIs so we
+            // couldn't reliably auto-detect it. Now the user explicitly
+            // marks tabs to keep alive with the checkbox on each tile.
+            //
+            // Algorithm:
+            //   1. Load the outgoing workspace's tab records from storage
+            //      to find which Chrome tab IDs correspond to a persistent
+            //      record (matched by canonical URL).
+            //   2. For each outgoing Chrome tab (excluding TabFlow):
+            //      - persistent && Firefox → chrome.tabs.hide + record in
+            //        hiddenTabs map
+            //      - else → chrome.tabs.remove (close)
+            const outgoingWsId = currentActiveWorkspace.id;
+            const outgoingRecords = await this.storage.getTabs(outgoingWsId);
+            // Map: canonicalUrl → [{ storageId, persistent }] (list to
+            // handle multiple tabs with the same URL — each Chrome tab
+            // claims the head).
+            const recordsByUrl = new Map<string, Array<{ storageId: string; persistent: boolean }>>();
+            for (const rec of outgoingRecords) {
+              const canon = canonicalizeUrl(rec.url);
+              const list = recordsByUrl.get(canon) || [];
+              list.push({ storageId: rec.id, persistent: !!rec.persistent });
+              recordsByUrl.set(canon, list);
+            }
+
+            const outgoingTabs = await chrome.tabs.query({ windowId: mainWindowId });
+            const tfStored = await chrome.storage.local.get('tabFlowTabId');
+            const tfId = tfStored?.tabFlowTabId;
+
+            // 0.1.54: Read the hiddenTabs map and build a set of Chrome tab
+            // IDs that are currently hidden (via chrome.tabs.hide()) because
+            // they belong to OTHER workspaces' persistent tabs. Those tabs
+            // live in the main window but should NOT be closed when we
+            // switch away from a different workspace.
+            //
+            // Bug this fixes: Sam had a YouTube PIP tab pushpinned. Switched
+            // YouTube→Guns (PIP tab hidden correctly). Switched Guns→YouTube.
+            // The outgoing-tabs handler queried the main window (which still
+            // contained the hidden YouTube tab), the hidden tab's YouTube URL
+            // didn't match any Guns record, so the loop fell into the "close"
+            // branch and Firefox removed the hidden tab — killing PIP.
+            const hiddenTabMap = await getHiddenTabsMap();
+            const hiddenChromeIds = new Set<number>(Object.values(hiddenTabMap));
+
+            let hiddenCount = 0;
+            let closedCount = 0;
+            for (const t of outgoingTabs) {
+              if (t.id === undefined || t.id === tfId) continue;
+              // Skip tabs that are already hidden as another workspace's
+              // persistent state — leave them alone during this switch.
+              if (hiddenChromeIds.has(t.id)) continue;
+              const canon = t.url ? canonicalizeUrl(t.url) : '';
+              const matches = recordsByUrl.get(canon);
+              const matched = matches && matches.length > 0 ? matches.shift()! : null;
+
+              if (matched && matched.persistent && isFirefox) {
+                try {
+                  await (chrome.tabs as any).hide([t.id]);
+                  await setHiddenTab(matched.storageId, t.id);
+                  hiddenCount++;
+                  await this.onDiagnostic?.('workspace-switch', 'hid persistent tab', {
+                    storageId: matched.storageId,
+                    chromeTabId: t.id,
+                  });
+                } catch (err) {
+                  console.warn('[TabFlow] chrome.tabs.hide failed, falling back to close:', err);
+                  await this.onDiagnostic?.('error', 'chrome.tabs.hide failed', {
+                    storageId: matched.storageId,
+                    chromeTabId: t.id,
+                    error: String(err),
+                  });
+                  try {
+                    await chrome.tabs.remove(t.id);
+                    closedCount++;
+                  } catch (err2) {
+                    console.warn('[TabFlow] fallback close also failed:', err2);
+                  }
                 }
-              } catch {
-                console.error('[TabFlow] Main window no longer exists after failed move — skipping closeAllTabs');
+              } else {
+                try {
+                  await chrome.tabs.remove(t.id);
+                  closedCount++;
+                } catch (err) {
+                  console.warn('[TabFlow] chrome.tabs.remove failed:', err);
+                }
               }
             }
+            await this.onDiagnostic?.('workspace-switch', 'outgoing tabs handled', {
+              hidden: hiddenCount,
+              closed: closedCount,
+            });
+            console.log(`[TabFlow] Outgoing workspace ${outgoingWsId}: ${hiddenCount} hidden, ${closedCount} closed`);
+          }
+        }
+
+        // 0.1.46: Show previously-hidden persistent tabs BEFORE any other
+        // restore path. Any incoming tab whose storageId is in the
+        // hiddenTabs map is a tab we hid via chrome.tabs.hide() on the
+        // previous switch away from this workspace — bring it back with
+        // chrome.tabs.show() so PIP, form state, and audio survive.
+        // Stale entries (Chrome tab gone) are pruned and fall through
+        // to normal creation.
+        const shownStorageIds = new Set<string>();
+        if (isFirefox) {
+          try {
+            const hiddenMap = await getHiddenTabsMap();
+            const allIncoming = await this.storage.getTabs(workspaceId);
+            for (const rec of allIncoming) {
+              const chromeTabId = hiddenMap[rec.id];
+              if (chromeTabId === undefined) continue;
+              let alive = false;
+              try {
+                const t = await chrome.tabs.get(chromeTabId);
+                alive = !!t;
+              } catch {
+                alive = false;
+              }
+              if (!alive) {
+                await clearHiddenTab(rec.id);
+                await this.onDiagnostic?.('cleanup', 'pruned stale hidden tab', {
+                  storageId: rec.id,
+                  reason: 'chrome.tabs.get failed on incoming',
+                });
+                continue;
+              }
+              try {
+                await (chrome.tabs as any).show([chromeTabId]);
+                await clearHiddenTab(rec.id);
+                shownStorageIds.add(rec.id);
+                await this.onDiagnostic?.('workspace-switch', 'showed persistent tab', {
+                  storageId: rec.id,
+                  chromeTabId,
+                });
+              } catch (err) {
+                console.warn('[TabFlow] chrome.tabs.show failed:', err);
+                await clearHiddenTab(rec.id);
+                await this.onDiagnostic?.('error', 'chrome.tabs.show failed', {
+                  storageId: rec.id,
+                  chromeTabId,
+                  error: String(err),
+                });
+              }
+            }
+          } catch (err) {
+            console.warn('[TabFlow] Persistent-tab show pass failed:', err);
           }
         }
 
@@ -692,7 +1090,9 @@ export class MessageHandler {
           // No hidden window — fall back to suspended tabs
           // This happens on first switch after browser restart or for new workspaces
           console.log('[TabFlow] No hidden window found, using suspended tab fallback');
-          const tabsToRestore = await this.storage.getTabs(workspaceId);
+          const allIncoming = await this.storage.getTabs(workspaceId);
+          // Filter out tabs we already handled via chrome.tabs.show above
+          const tabsToRestore = allIncoming.filter((t) => !shownStorageIds.has(t.id));
           // Pass the pre-captured mainWindowId so tabs are created in the right window
           await this.tabManager.restoreWorkspaceTabs(tabsToRestore, this.storage, mainWindowId);
         } else {
@@ -706,6 +1106,66 @@ export class MessageHandler {
             console.log(`[TabFlow] Also restoring ${pendingTabs.length} pending tab(s) not in hidden window`);
             await this.tabManager.restoreWorkspaceTabs(pendingTabs, this.storage, mainWindowId);
           }
+        }
+
+        // 0.1.56: Reorder tabs in the main window to match DB sortOrder.
+        //
+        // Bug this fixes: chrome.tabs.show() unhides a persistent tab at
+        // Firefox's choice of position (typically right after TabFlow at
+        // index 1), then restoreWorkspaceTabs / restoreTabsFromHiddenWindow
+        // append new tabs at the end of the tab strip. Result: the
+        // pushpin'd tab ends up FIRST instead of at its original sortOrder
+        // position. Then finalReconcile's snapshot reads that scrambled
+        // order and overwrites the DB's sortOrder — persistently
+        // corrupting the workspace's tab order.
+        //
+        // Fix: walk the workspace's DB records in sortOrder and move each
+        // corresponding Chrome tab to its correct browser-strip position.
+        // The TabFlow tab is pinned at index 0, so DB position N maps to
+        // browser index N+1.
+        try {
+          const orderedRecords = (await this.storage.getTabs(workspaceId))
+            .slice()
+            .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+
+          const tfStored2 = await chrome.storage.local.get('tabFlowTabId');
+          const tfId2 = tfStored2?.tabFlowTabId;
+          const liveTabs = await chrome.tabs.query({ windowId: mainWindowId });
+          const nonTabFlowLive = liveTabs.filter(
+            (t) => t.id !== undefined && !t.hidden && t.id !== tfId2
+          );
+          // Build a URL -> [chromeTabId] lookup so we can match DB records
+          // to live tabs. Uses canonicalizeUrl so &t=Ns differences don't
+          // break the match. Multiple tabs with the same canonical URL are
+          // matched in order (each DB record claims the head of its bucket).
+          const urlBuckets = new Map<string, number[]>();
+          for (const t of nonTabFlowLive) {
+            const canon = canonicalizeUrl(this.tabManager.getRealUrl(t.url || ''));
+            const list = urlBuckets.get(canon) || [];
+            if (t.id !== undefined) list.push(t.id);
+            urlBuckets.set(canon, list);
+          }
+
+          let moved = 0;
+          for (let i = 0; i < orderedRecords.length; i++) {
+            const rec = orderedRecords[i];
+            const canon = canonicalizeUrl(rec.url);
+            const bucket = urlBuckets.get(canon);
+            if (!bucket || bucket.length === 0) continue;
+            const chromeTabId = bucket.shift()!;
+            const targetIndex = i + 1; // +1 for pinned TabFlow tab at index 0
+            try {
+              await chrome.tabs.move(chromeTabId, { index: targetIndex });
+              moved++;
+            } catch (err) {
+              console.warn(`[TabFlow] chrome.tabs.move failed for tab ${chromeTabId}:`, err);
+            }
+          }
+          if (moved > 0) {
+            console.log(`[TabFlow] Reordered ${moved} tabs to match DB sortOrder`);
+          }
+        } catch (err) {
+          console.warn('[TabFlow] Tab reorder pass failed:', err);
         }
 
         console.log(`[TabFlow] Workspace switch completed`);
@@ -734,11 +1194,37 @@ export class MessageHandler {
         // Brief delay for Chrome's tab events to settle
         await new Promise((resolve) => setTimeout(resolve, 300));
 
-        // CRITICAL: After tabs are restored, save the target workspace's
-        // current Chrome tabs to storage. This ensures storage reflects the
-        // ACTUAL tabs in the window, not stale records from a previous switch.
-        // Without this, the UI tiles show old data until a manual refresh.
-        await this.tabManager.saveCurrentTabsToWorkspace(workspaceId, this.storage, mainWindowId);
+        // Belt-and-suspenders: ensure the main window is actually visible
+        // after the move/restore dance. moveTabsToHiddenWindow creates a
+        // minimized hidden window, and on Firefox the main window can end
+        // up minimized too via a focus race (especially when the native
+        // host's hideMinimized runs). Without this, the user sees no tabs
+        // at the top of the browser until they click a tile and the
+        // ACTIVATE_TAB_BY_URL self-heal kicks in.
+        try {
+          const mainWin = await chrome.windows.get(mainWindowId);
+          if (mainWin.state === 'minimized') {
+            await chrome.windows.update(mainWindowId, { state: 'normal' });
+            console.log('[TabFlow] Workspace switch: unminimized main window');
+          }
+          await chrome.windows.update(mainWindowId, { focused: true });
+        } catch (e) {
+          console.warn('[TabFlow] Could not ensure main window visibility after switch:', e);
+        }
+
+        // Phase 2 (gate-hardening): the post-restore snapshot is now the
+        // operation's final reconcile, called via the service-worker
+        // callback. Same `saveCurrentTabsToWorkspace` effect — but the
+        // callback adds a 200ms settle first so any straggling
+        // chrome.tabs events from the move/restore dance can land
+        // before the snapshot reads the window. Old explicit call:
+        //   await this.tabManager.saveCurrentTabsToWorkspace(workspaceId, this.storage, mainWindowId);
+        if (this.onFinalReconcile) {
+          await this.onFinalReconcile(workspaceId, 'handleSwitchWorkspace');
+        } else {
+          // Fallback for callers that didn't pass the reconcile callback.
+          await this.tabManager.saveCurrentTabsToWorkspace(workspaceId, this.storage, mainWindowId);
+        }
         console.log(`[TabFlow] Saved fresh tab snapshot for target workspace ${workspaceId}`);
 
         // Notify UI to refresh with the updated data
@@ -746,18 +1232,39 @@ export class MessageHandler {
           await chrome.storage.session.set({ syncUpdateTs: Date.now() });
         } catch { /* session storage not available */ }
 
+        // 0.1.34: Run thumbnail backfill INSIDE the system operation
+        // (before runSystemOperation returns). The gate stays set, the
+        // loading modal stays up, and user clicks can't race the
+        // backfill's tab activations. Awaited; failures are non-fatal.
+        if (this.onPostOperationBackfill) {
+          try {
+            await this.onPostOperationBackfill(workspaceId);
+          } catch (err) {
+            console.warn('[TabFlow] Inline thumbnail backfill failed (non-fatal):', err);
+          }
+        }
+
+        await this.onDiagnostic?.('workspace-switch', 'complete', { targetId: workspaceId });
         return { success: true, data: { activeWorkspaceId: workspaceId } };
       } finally {
         this.onSwitchingWorkspacesChange?.(false);
       }
     } catch (error) {
       console.error('[TabFlow] Error during workspace switch:', error);
+      await this.onDiagnostic?.('error', 'switch-workspace step failed', { step: 'switch-body', error: String(error) });
       this.onSwitchingWorkspacesChange?.(false);
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Failed to switch workspace',
       };
     }
+    });
+
+    // 0.1.34: backfill now runs INSIDE the runSystemOperation block
+    // above so the loading modal blocks user clicks throughout. No more
+    // fire-and-forget scheduler.
+
+    return result;
   }
 
   /**
@@ -813,60 +1320,113 @@ export class MessageHandler {
     const entry = allEntries.find((e) => e.id === entryId);
     if (!entry) return { success: false, error: 'History entry not found' };
 
+    return await runSystemOperation('handleRestoreHistoryEntry', async () => {
+
     // Check if this workspace is the currently active one
     const workspaces = await this.storage.getWorkspaces(LOCAL_USER_ID);
     const isActive = workspaces.find((ws) => ws.id === workspaceId)?.isActive ?? false;
 
-    // Delete existing tabs for this workspace
-    const existingTabs = await this.storage.getTabs(workspaceId);
-    for (const tab of existingTabs) {
-      await this.storage.deleteTab(tab.id);
-    }
+    // CRITICAL: Set the isSwitchingWorkspaces gate before we start touching
+    // browser tabs and storage. Without this, the chrome.tabs.remove() calls
+    // below fire onRemoved events that trigger snapshotActiveWorkspace, which
+    // in turn calls saveCurrentTabsToWorkspace - which sees the browser
+    // window is empty (mid-restore) and deletes the freshly-saved storage
+    // records we just wrote. The 0.1.18 strict cloud mirror then pushes the
+    // wrong (deleted) state to Supabase. So we wrap the entire flow in the
+    // gate and add a settle delay after restoreWorkspaceTabs so late tab
+    // events land while the gate is still up.
+    this.onSwitchingWorkspacesChange?.(true);
 
-    // Create new tab records from the history entry
-    const now = new Date();
-    const newTabs = entry.tabs.map((ht) => ({
-      id: crypto.randomUUID(),
-      workspaceId,
-      url: ht.url,
-      title: ht.title,
-      faviconUrl: ht.faviconUrl,
-      sortOrder: ht.sortOrder,
-      isPinned: ht.isPinned,
-      lastAccessed: now,
-      updatedAt: now,
-    }));
-    await this.storage.saveTabs(newTabs);
-
-    console.log(`[TabFlow] Restored workspace ${workspaceId} to history entry ${entryId} (${newTabs.length} tabs)`);
-
-    // If this is the active workspace, also restore the actual Chrome tabs
-    if (isActive) {
-      try {
-        const mainWindowId = await this.tabManager.getMainWindowId();
-        if (mainWindowId !== undefined) {
-          // Close existing workspace tabs (not the pinned TabFlow tab)
-          const chromeTabs = await chrome.tabs.query({ windowId: mainWindowId });
-          const tabsToClose = chromeTabs.filter((ct) => !ct.pinned && ct.url !== 'chrome://newtab/');
-          if (tabsToClose.length > 0) {
-            await chrome.tabs.remove(tabsToClose.map((ct) => ct.id!));
-          }
-
-          // Open the restored tabs
-          await this.tabManager.restoreWorkspaceTabs(newTabs, this.storage, mainWindowId);
-          console.log('[TabFlow] Active workspace tabs restored in browser');
-        }
-      } catch (err) {
-        console.warn('[TabFlow] Could not restore active workspace tabs in browser:', err);
-      }
-    }
-
-    // Notify UI to refresh
     try {
-      await chrome.storage.session.set({ syncUpdateTs: Date.now() });
-    } catch { /* session storage not available */ }
+      // Delete existing tabs for this workspace
+      const existingTabs = await this.storage.getTabs(workspaceId);
+      for (const tab of existingTabs) {
+        await this.storage.deleteTab(tab.id);
+      }
 
-    return { success: true, data: { restoredTabs: newTabs.length } };
+      // Create new tab records from the history entry
+      const now = new Date();
+      const newTabs = entry.tabs.map((ht) => ({
+        id: crypto.randomUUID(),
+        workspaceId,
+        url: ht.url,
+        title: ht.title,
+        faviconUrl: ht.faviconUrl,
+        sortOrder: ht.sortOrder,
+        isPinned: ht.isPinned,
+        lastAccessed: now,
+        updatedAt: now,
+      }));
+      await this.storage.saveTabs(newTabs);
+
+      console.log(`[TabFlow] Restored workspace ${workspaceId} to history entry ${entryId} (${newTabs.length} tabs)`);
+
+      // If this is the active workspace, also restore the actual Chrome tabs
+      if (isActive) {
+        try {
+          const mainWindowId = await this.tabManager.getMainWindowId();
+          if (mainWindowId !== undefined) {
+            // Close existing workspace tabs, but protect the TabFlow tab
+            // regardless of pinned state. 0.1.36: the old filter
+            // (!pinned && url !== 'chrome://newtab/') would close the
+            // TabFlow tab when Firefox session restore left it unpinned —
+            // its real URL is chrome-extension://<id>/newtab.html or
+            // moz-extension://<id>/newtab.html, not chrome://newtab/.
+            const chromeTabs = await chrome.tabs.query({ windowId: mainWindowId });
+            const stored = await chrome.storage.local.get('tabFlowTabId');
+            const tabFlowTabId: number | undefined = stored?.tabFlowTabId;
+            const tabFlowUrl = getExtensionPageUrl('newtab.html');
+            const tabsToClose = chromeTabs.filter((ct) => {
+              if (ct.id === undefined) return false;
+              if (tabFlowTabId !== undefined && ct.id === tabFlowTabId) return false;
+              const url = ct.url || '';
+              if (url.startsWith(tabFlowUrl)) return false;
+              return true;
+            });
+            console.log(`[TabFlow] handleRestoreHistoryEntry: closing ${tabsToClose.length} of ${chromeTabs.length} tabs in main window (tabFlowTabId=${tabFlowTabId})`);
+            if (tabsToClose.length > 0) {
+              await chrome.tabs.remove(tabsToClose.map((ct) => ct.id!));
+            }
+
+            // Open the restored tabs
+            await this.tabManager.restoreWorkspaceTabs(newTabs, this.storage, mainWindowId);
+            console.log('[TabFlow] Active workspace tabs restored in browser');
+
+            // Settle: let any late chrome.tabs events fire (and be ignored,
+            // because the gate is still up) before we lower the gate.
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        } catch (err) {
+          console.warn('[TabFlow] Could not restore active workspace tabs in browser:', err);
+        }
+      }
+
+      // Notify UI to refresh
+      try {
+        await chrome.storage.session.set({ syncUpdateTs: Date.now() });
+      } catch { /* session storage not available */ }
+
+      // Phase 2 (gate-hardening): final reconcile catches any tabs
+      // restoreWorkspaceTabs opened that hadn't registered yet when the
+      // 500ms settle above ended, and ensures the DB matches the window's
+      // final state. Only meaningful for the active workspace (where we
+      // actually opened browser tabs); for inactive workspaces the
+      // storage writes above are already authoritative, but reconciling
+      // is harmless because saveCurrentTabsToWorkspace operates against
+      // the active workspace's window contents — the inactive case will
+      // just no-op cleanup since none of the restored records' URLs are
+      // in the live window. Guard on `isActive` to skip the reconcile
+      // for inactive workspaces and avoid deleting their fresh records.
+      if (isActive && this.onFinalReconcile) {
+        await this.onFinalReconcile(workspaceId, 'handleRestoreHistoryEntry');
+      }
+
+      return { success: true, data: { restoredTabs: newTabs.length } };
+    } finally {
+      // Always lower the gate, even if something above threw.
+      this.onSwitchingWorkspacesChange?.(false);
+    }
+    });
   }
 
   // ==================== SEARCH ====================
@@ -1041,12 +1601,28 @@ export class MessageHandler {
         return tabUrl;
       };
 
+      // Helper: bring the activated tab's window into focus, un-minimizing if needed
+      const focusWindow = async (windowId: number | undefined): Promise<void> => {
+        if (windowId === undefined) return;
+        try {
+          const win = await chrome.windows.get(windowId);
+          if (win.state === 'minimized') {
+            await chrome.windows.update(windowId, { state: 'normal', focused: true });
+          } else {
+            await chrome.windows.update(windowId, { focused: true });
+          }
+        } catch (err) {
+          console.warn('[TabFlow] ACTIVATE_TAB_BY_URL: focusWindow failed', err);
+        }
+      };
+
       // Pass 1: exact match (direct URL or real URL extracted from suspended)
       for (const tab of windowTabs) {
         if (!tab.url || !tab.id) continue;
         const realUrl = getRealUrl(tab.url);
         if (realUrl === url) {
           await chrome.tabs.update(tab.id, { active: true });
+          await focusWindow(tab.windowId);
           console.log(`[TabFlow] ACTIVATE_TAB_BY_URL: exact match tab ${tab.id} (url: ${tab.url})`);
           return { success: true, data: { found: true, tabId: tab.id } };
         }
@@ -1061,6 +1637,7 @@ export class MessageHandler {
             const tabUrl = new URL(realUrl);
             if (tabUrl.origin === targetOrigin && tabUrl.pathname === targetPathname) {
               await chrome.tabs.update(tab.id, { active: true });
+              await focusWindow(tab.windowId);
               console.log(`[TabFlow] ACTIVATE_TAB_BY_URL: loose match tab ${tab.id} (${realUrl})`);
               return { success: true, data: { found: true, tabId: tab.id } };
             }
@@ -1158,6 +1735,15 @@ export class MessageHandler {
 
       // Remove from archive
       await storageAny.permanentlyDeleteWorkspace(archiveId);
+
+      // 0.1.37: tell the cloud archive to remove this row too, so the
+      // restore propagates across devices. Non-fatal.
+      try {
+        await this.onPushRestoredWorkspaceToCloud?.(archiveId);
+      } catch (cloudErr) {
+        console.warn('[TabFlow] Failed to remove archive entry from cloud (non-fatal):', cloudErr);
+      }
+
       restoredCount++;
       console.log(`[TabFlow] Restored workspace "${entry.workspace.name}" as ${newWorkspaceId}`);
     }
@@ -1180,6 +1766,13 @@ export class MessageHandler {
     for (const archiveId of archiveIds) {
       try {
         await storageAny.permanentlyDeleteWorkspace(archiveId);
+        // 0.1.37: also remove from the cloud archive so emptying the
+        // recycle bin sticks across devices. Non-fatal.
+        try {
+          await this.onPushRestoredWorkspaceToCloud?.(archiveId);
+        } catch (cloudErr) {
+          console.warn('[TabFlow] Failed to remove archive from cloud (non-fatal):', cloudErr);
+        }
         deletedCount++;
       } catch (err) {
         console.warn(`[TabFlow] Failed to permanently delete archive ${archiveId}:`, err);

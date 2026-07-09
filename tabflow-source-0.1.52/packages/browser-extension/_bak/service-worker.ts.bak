@@ -1,0 +1,3058 @@
+/**
+ * TabFlow Chrome Extension — Background Service Worker
+ *
+ * Handles:
+ * - Message routing from popup/sidebar via MessageHandler
+ * - Auth state monitoring and sync initialization
+ * - Tab event listeners for real-time tracking
+ */
+
+import { MessageHandler, MessageType, Message, Response } from './MessageHandler';
+import * as AuthManager from '../auth/AuthManager';
+import { SupabaseSyncClient, getOrCreateDeviceId, getDeviceName } from '../sync/SupabaseSyncClient';
+import { storage } from '../storage/IndexedDBAdapter';
+import { TabManager } from './TabManager';
+import { WorkspaceEngine } from '@tabflow/core';
+import { deriveKey } from '@tabflow/core';
+import { encrypt, decrypt } from '@tabflow/core/crypto/encryption';
+import { getExtensionBaseUrl, getExtensionPageUrl, isFirefox } from '../browser-compat';
+import { canonicalizeUrl, computeTabId } from '../utils/tabId';
+import { preloadGate, isGateSetSync, runSystemOperation, getGateStateRaw } from './SystemOperationGate';
+
+/**
+ * Known plaintext encrypted with the user's key and stored in user_settings.canary.
+ * On every sign-in we attempt to decrypt this. If decryption fails, the passphrase
+ * entered on THIS device does not match the one that encrypted the cloud data —
+ * we halt sync rather than silently pushing up rows encrypted with the wrong key.
+ */
+const CANARY_PLAINTEXT = 'tabflow-canary-v1';
+
+// Tab manager for workspace switching and tab tracking
+// Created FIRST so it can be shared with MessageHandler
+const tabManager = new TabManager();
+
+// Scroll positions are stored exclusively in Supabase — no local cache.
+
+// Core message handler (local operations) — shares the same TabManager
+// so native host init on the service worker's tabManager is visible
+// to moveTabsToHiddenWindow inside MessageHandler.
+const messageHandler = new MessageHandler(
+  storage,
+  (value: boolean) => {
+    isSwitchingWorkspaces = value;
+    // When a workspace switch finishes, refresh the cached main window ID
+    // since tabs may have moved between windows
+    if (!value) {
+      refreshMainWindowId();
+    }
+  },
+  tabManager,
+  (workspaceId, operationName) => finalReconcile(workspaceId, operationName),
+  async (workspaceId) => {
+    // 0.1.34: backfill runs INSIDE the workspace switch operation, while
+    // the gate is still set and the blocking loading modal is up. User
+    // clicks can't race the backfill's tab activations. No setTimeout —
+    // the operation does not return until backfill completes.
+    await backfillThumbnails(workspaceId);
+  },
+  // 0.1.37: cross-device archive sync. The callbacks no-op if syncClient
+  // isn't initialised, this device isn't active, or push isn't safe.
+  // Local writes are never blocked by cloud failures — the callbacks
+  // throw at most a swallowed warning.
+  async (entry) => {
+    if (!syncClient || !syncUserId) return;
+    const { isActive } = await syncClient.isActiveDeviceFromDb();
+    if (!isActive) return;
+    if (!(await isSafeToPush())) return;
+    try {
+      syncClient.setPushing(true);
+      await syncClient.pushDeletedWorkspace(entry, syncUserId);
+      // Fire-and-forget retention prune so cloud doesn't grow forever.
+      syncClient.pruneOldDeletedWorkspaces(syncUserId).catch(() => {});
+    } finally {
+      syncClient.setPushing(false);
+    }
+  },
+  async (archiveId) => {
+    if (!syncClient || !syncUserId) return;
+    const { isActive } = await syncClient.isActiveDeviceFromDb();
+    if (!isActive) return;
+    if (!(await isSafeToPush())) return;
+    try {
+      syncClient.setPushing(true);
+      await syncClient.pushRestoredWorkspace(archiveId, syncUserId);
+    } finally {
+      syncClient.setPushing(false);
+    }
+  },
+  // 0.1.38: PIP-aware workspace switch. Returns true if any of the
+  // given Chrome tab IDs has Picture-in-Picture active. The SW
+  // maintains the pipActiveTabs Set; MessageHandler consults it
+  // via this callback to decide whether to preserve outgoing tabs
+  // in a hidden window (PIP) or just close them (no PIP).
+  //
+  // 0.1.40: belt-and-suspenders live query. First check the persisted
+  // Set (fast path). If nothing matches, ask each outgoing tab's
+  // content script directly via QUERY_PIP_STATE — catches the case
+  // where a PIP_STATE_CHANGED message was lost or the SW slept and
+  // missed a start event. Tabs without content scripts (privileged
+  // URLs, etc.) silently return null and are treated as no PIP.
+  async (outgoingTabIds: number[]): Promise<boolean> => {
+    for (const id of outgoingTabIds) {
+      if (pipActiveTabs.has(id)) {
+        console.log(`[TabFlow] PIP active on tab ${id} (from persisted state)`);
+        return true;
+      }
+    }
+    const promises = outgoingTabIds.map(async (id) => {
+      try {
+        const response = await chrome.tabs
+          .sendMessage(id, { type: 'QUERY_PIP_STATE' })
+          .catch(() => null);
+        if (response?.hasPip) {
+          pipActiveTabs.add(id);
+          await persistPipActiveTabs();
+          console.log(`[TabFlow] PIP active on tab ${id} (discovered via live query)`);
+          return true;
+        }
+      } catch {}
+      return false;
+    });
+    const results = await Promise.all(promises);
+    return results.some((r) => r);
+  },
+);
+// Scroll positions live in Supabase only — no cache to share with MessageHandler.
+
+// Workspace engine for workspace queries
+const workspaceEngine = new WorkspaceEngine(storage);
+
+// Flag to prevent tab tracking events during workspace switches
+let isSwitchingWorkspaces = false;
+
+// Flag to suppress ALL tab events during extension startup/reload.
+// Chrome closes and recreates extension pages on reload, which would
+// trigger onRemoved and delete tab records from storage if not suppressed.
+let isStartingUp = true;
+
+/**
+ * 0.1.38: Chrome tab IDs currently in Picture-in-Picture mode.
+ *
+ * Populated by the pip-tracker content script via the
+ * `PIP_STATE_CHANGED` message. Used by handleSwitchWorkspace (via the
+ * onCheckPipActive callback) to decide whether the outgoing workspace's
+ * tabs need to be preserved in a hidden minimized window (so the PIP
+ * video keeps playing) or can just be closed.
+ *
+ * Entries are removed on chrome.tabs.onRemoved so the Set doesn't leak
+ * stale IDs from closed tabs. A stale ID would at worst cause an
+ * unnecessary hidden window to be created on the next switch — not a
+ * correctness issue, but worth keeping clean.
+ */
+const pipActiveTabs = new Set<number>();
+
+/**
+ * 0.1.40: Persist pipActiveTabs to chrome.storage.session so the Set
+ * survives MV3 service-worker sleep/wake cycles. Without persistence,
+ * the SW going idle between a PIP start and a workspace switch would
+ * leave the Set empty and the switch would close the PIP source tab,
+ * killing the video. Session storage is cleared on browser restart,
+ * which matches PIP's own lifecycle (PIP can't survive a browser close
+ * anyway), so storing here is correct.
+ */
+const PIP_STORAGE_KEY = 'tabflow_pip_active_tabs';
+
+async function persistPipActiveTabs(): Promise<void> {
+  try {
+    await chrome.storage.session.set({ [PIP_STORAGE_KEY]: Array.from(pipActiveTabs) });
+  } catch (err) {
+    console.warn('[TabFlow] persistPipActiveTabs error:', err);
+  }
+}
+
+async function restorePipActiveTabs(): Promise<void> {
+  try {
+    const stored = await chrome.storage.session.get(PIP_STORAGE_KEY);
+    const arr = (stored?.[PIP_STORAGE_KEY] as number[] | undefined) ?? [];
+    pipActiveTabs.clear();
+    for (const id of arr) pipActiveTabs.add(id);
+    console.log(`[TabFlow] restored ${pipActiveTabs.size} PIP-active tab(s) from session storage`);
+  } catch (err) {
+    console.warn('[TabFlow] restorePipActiveTabs error:', err);
+  }
+}
+
+/**
+ * Timestamp of the most recent chrome.tabs.onCreated event. Used by
+ * waitForTabsToSettle() so the startup reconciler doesn't fire before
+ * Firefox finishes session restore (which can take 500-800ms after the
+ * service worker wakes). Set to Date.now() at SW startup so the first
+ * iteration of the settle loop has a sane "last create" reference.
+ */
+let lastTabCreatedAt = Date.now();
+
+/**
+ * Register the tab-created tracker IMMEDIATELY (top of module, before any
+ * awaits) so we don't miss any events fired by Firefox session restore
+ * while the IIFE is awaiting preloadGate() / migrateTabIdsV1().
+ *
+ * The full snapshot-triggering listener is added later (see below) — it
+ * does the gate/startup early-returns. This listener only tracks the
+ * timestamp and does nothing else. Multiple onCreated listeners is fine.
+ */
+chrome.tabs.onCreated.addListener(() => {
+  lastTabCreatedAt = Date.now();
+});
+
+/**
+ * Wait until tab events have settled before running the startup reconciler.
+ * Firefox session restore fires chrome.tabs.onCreated for each restored
+ * tab over 500-800ms (sometimes more on slow machines or large sessions).
+ * If we reconcile before those events finish, the reconciler closes
+ * the existing main-window tabs and materializes the active workspace,
+ * then session-restored tabs land AFTER and the user sees stray tabs.
+ *
+ * Settle criteria: at least 1.5 seconds since the last onCreated event,
+ * AND at least 500ms since SW startup (minimum wait floor). Hard ceiling
+ * of 8 seconds in case some weird scenario keeps firing creates.
+ */
+async function waitForTabsToSettle(): Promise<void> {
+  const startedAt = Date.now();
+  console.log('[TabFlow] waitForTabsToSettle: waiting for tab events to quiesce before reconciler');
+  while (Date.now() - startedAt < 8000) {
+    const sinceLastCreate = Date.now() - lastTabCreatedAt;
+    const sinceStart = Date.now() - startedAt;
+    if (sinceLastCreate >= 1500 && sinceStart >= 500) {
+      console.log(`[TabFlow] Tabs settled after ${sinceStart}ms (last create ${sinceLastCreate}ms ago)`);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  console.log('[TabFlow] Tab settle timeout (8s) — proceeding with reconcile');
+}
+
+/**
+ * Cached main window ID. Only tabs in THIS window are tracked.
+ * This replaces the old "isInHiddenWindow" blocklist approach which
+ * failed on Chrome restart (hidden window map was stale).
+ *
+ * The allowlist approach is fundamentally more reliable: we only
+ * need to know ONE window ID (the main one), and everything else
+ * is ignored.
+ */
+let cachedMainWindowId: number | undefined = undefined;
+
+/** Updates the cached main window ID. Called on startup and when windows change. */
+async function refreshMainWindowId(): Promise<void> {
+  cachedMainWindowId = await tabManager.getMainWindowId();
+  if (cachedMainWindowId !== undefined) {
+    console.log(`[TabFlow] Main window ID cached: ${cachedMainWindowId}`);
+  }
+}
+
+/** Checks if a tab event should be tracked (only tabs in the main window). */
+function isInMainWindow(windowId: number | undefined): boolean {
+  if (windowId === undefined || cachedMainWindowId === undefined) return false;
+  return windowId === cachedMainWindowId;
+}
+
+// Local user ID (single-user for now)
+const LOCAL_USER_ID = 'local-user';
+
+// Sync client (initialized after auth)
+let syncClient: SupabaseSyncClient | null = null;
+
+// Real Supabase user ID (set after auth)
+let syncUserId: string | null = null;
+
+/**
+ * Wait up to `timeoutMs` for `syncClient` and `syncUserId` to be ready.
+ * The IIFE sets them asynchronously after gate preload, tab settle, and
+ * reconcile, so a user clicking Resume Working Here a moment after the
+ * browser starts can race that init. Polling here avoids the spurious
+ * "Sync not initialized" error.
+ *
+ * Returns true if both became non-null within the timeout, false otherwise.
+ */
+async function waitForSyncReady(timeoutMs = 5000, pollMs = 100): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (syncClient && syncUserId) return true;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return !!(syncClient && syncUserId);
+}
+
+
+/**
+ * Redirect the user to the pinned TabFlow tab if this device is inactive.
+ * Used by onActivated and onFocusChanged to enforce the "Resume Working Here"
+ * gate.
+ *
+ * Hits the database on every call. There is no cached flag. If syncClient
+ * isn't set up yet (service worker just woke up and hasn't finished
+ * initializeSync), we skip the redirect rather than consult a stale cache —
+ * the next tab click after sync initializes will enforce correctly.
+ */
+async function enforceTabLock(): Promise<void> {
+  if (!syncClient) return;
+
+  const { isActive } = await syncClient.isActiveDeviceFromDb();
+  if (isActive) return;
+
+  const stored = await chrome.storage.local.get('tabFlowTabId');
+  const tfTabId = stored.tabFlowTabId;
+  if (!tfTabId) return;
+
+  // Chrome ignores chrome.tabs.update({active:true}) when called
+  // synchronously inside onActivated — the user's click takes priority.
+  // Delay the redirect so it runs after Chrome finishes processing the
+  // user gesture.
+  setTimeout(async () => {
+    try {
+      await chrome.tabs.update(tfTabId, { active: true });
+    } catch {
+      // Tab may not exist — non-fatal
+    }
+  }, 200);
+}
+
+/**
+ * Notify all extension pages (new tab, popup, sidebar) that data changed.
+ *
+ * Uses chrome.storage.session as the notification channel because
+ * chrome.runtime.sendMessage is unreliable for reaching extension pages
+ * (especially pinned newtab overrides that may be in the background).
+ * chrome.storage.onChanged fires reliably in ALL extension contexts.
+ */
+function broadcastSyncUpdate() {
+  chrome.storage.session.set({ syncUpdateTs: Date.now() }).catch(() => {
+    // storage.session not available — ignore
+  });
+}
+
+/**
+ * Initialize sync after user authenticates.
+ * Derives the encryption key from the stored passphrase and starts real-time sync.
+ */
+async function initializeSync(userId: string) {
+  try {
+    // Get encryption passphrase from chrome.storage
+    const stored = await chrome.storage.local.get(['encryptionPassphrase', 'encryptionSalt']);
+
+    if (!stored.encryptionPassphrase) {
+      console.warn('[TabFlow] No encryption passphrase found — sync disabled');
+      return;
+    }
+
+    // Get Supabase client FIRST so we can consult the authoritative
+    // user_settings row before deriving a key with a possibly-wrong salt.
+    const supabase = await AuthManager.initialize();
+
+    // ── Salt reconciliation ────────────────────────────────────────────────
+    // user_settings.encryption_salt is the SOURCE OF TRUTH. On a fresh install
+    // (folder rename, new computer, reinstall) chrome.storage.local starts
+    // empty — without this step we would generate a new salt, derive a new
+    // key, and push garbage encrypted data to the cloud overwriting the user's
+    // real rows. Query first; only generate/upload on genuine first-run.
+    const { data: settingsRow, error: settingsErr } = await supabase
+      .from('user_settings')
+      .select('encryption_salt, canary')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (settingsErr) {
+      console.error('[TabFlow] Failed to read user_settings:', settingsErr);
+      // Don't abort — user may not have run the migration yet. Fall back to
+      // legacy behavior (local-salt-only) but keep sync push-only to protect data.
+    }
+
+    let saltBytes: Uint8Array | undefined;
+    let remoteSaltExists = false;
+
+    if (settingsRow?.encryption_salt) {
+      remoteSaltExists = true;
+      try {
+        saltBytes = new Uint8Array(JSON.parse(settingsRow.encryption_salt));
+      } catch (e) {
+        console.error('[TabFlow] user_settings.encryption_salt is malformed:', e);
+        saltBytes = undefined;
+      }
+    } else if (stored.encryptionSalt) {
+      // No remote row yet — use whatever is local (first-run on this account).
+      saltBytes = new Uint8Array(JSON.parse(stored.encryptionSalt));
+    }
+
+    // Derive encryption key using the authoritative salt (or a newly-generated
+    // one when both remote and local are absent).
+    const { key, salt } = await deriveKey(stored.encryptionPassphrase, saltBytes);
+
+    // Always mirror the authoritative salt into local storage so subsequent
+    // cold-starts don't drift.
+    await chrome.storage.local.set({
+      encryptionSalt: JSON.stringify(Array.from(salt)),
+    });
+
+    // ── Canary check ───────────────────────────────────────────────────────
+    // If a canary exists in user_settings, it was encrypted with the correct
+    // key. Try to decrypt with ours: success → passphrase matches → safe to
+    // push. Failure → passphrase mismatch → HALT sync entirely so we don't
+    // overwrite real data with garbage.
+    if (remoteSaltExists && settingsRow?.canary) {
+      try {
+        const decoded = await decrypt(settingsRow.canary, key);
+        if (decoded !== CANARY_PLAINTEXT) {
+          // Decrypt succeeded but payload is wrong — shouldn't happen unless
+          // the schema changes. Treat as mismatch.
+          throw new Error('canary payload mismatch');
+        }
+        console.log('[TabFlow] Passphrase canary verified ✓');
+      } catch (err) {
+        console.error('[TabFlow] Passphrase canary FAILED — sync halted:', err);
+        // Tell all UI pages to surface the error + force re-entry.
+        chrome.storage.session.set({
+          passphraseMismatch: {
+            ts: Date.now(),
+            message:
+              'The passphrase on this device does not match the one used to ' +
+              'encrypt your cloud data. Sync is paused to protect your data. ' +
+              'Sign out and sign in again with the ORIGINAL passphrase.',
+          },
+        }).catch(() => {});
+        return; // Do NOT create syncClient; do NOT push anything.
+      }
+    } else if (!remoteSaltExists) {
+      // First-run for this account on this (or any) device. Seed the canary
+      // + salt so future devices can verify against it.
+      try {
+        const canaryCiphertext = await encrypt(CANARY_PLAINTEXT, key);
+        const { error: upsertErr } = await supabase
+          .from('user_settings')
+          .upsert(
+            {
+              user_id: userId,
+              encryption_salt: JSON.stringify(Array.from(salt)),
+              canary: canaryCiphertext,
+            },
+            { onConflict: 'user_id' }
+          );
+        if (upsertErr) {
+          console.error('[TabFlow] Failed to seed user_settings:', upsertErr);
+        } else {
+          console.log('[TabFlow] Seeded user_settings with salt + canary');
+        }
+      } catch (e) {
+        console.error('[TabFlow] Failed to encrypt canary:', e);
+      }
+    } else if (remoteSaltExists && !settingsRow?.canary) {
+      // Legacy row exists with a salt but no canary (user set up before this
+      // safeguard shipped). Backfill the canary now — the salt is already
+      // authoritative, so if the passphrase is wrong the user's data is
+      // already wrong in the cloud and there is nothing we can verify against.
+      try {
+        const canaryCiphertext = await encrypt(CANARY_PLAINTEXT, key);
+        const { error: updateErr } = await supabase
+          .from('user_settings')
+          .update({ canary: canaryCiphertext })
+          .eq('user_id', userId);
+        if (updateErr) {
+          console.error('[TabFlow] Failed to backfill canary:', updateErr);
+        } else {
+          console.log('[TabFlow] Backfilled canary on existing user_settings row');
+        }
+      } catch (e) {
+        console.error('[TabFlow] Failed to encrypt canary for backfill:', e);
+      }
+    }
+
+    // Get or create a stable device ID for this Chrome installation
+    const deviceId = await getOrCreateDeviceId();
+    console.log('[TabFlow] Device ID:', deviceId);
+
+    // Create and connect sync client with remote change callback + device change callback
+    syncClient = new SupabaseSyncClient(
+      supabase,
+      storage,
+      key,
+      LOCAL_USER_ID,
+      () => {
+        console.log('[TabFlow] Remote change received, broadcasting to UI');
+        broadcastSyncUpdate();
+      },
+      async (isActive: boolean, claimedBy?: string) => {
+        console.log(`[TabFlow] Active device changed: isActive=${isActive}, claimedBy=${claimedBy || 'self'}`);
+        // No storage broadcast. The UI polls GET_DEVICE_STATUS, which
+        // queries Supabase directly — the database is the single source
+        // of truth, and we're not layering chrome.storage.session /
+        // chrome.storage.local caches on top of it anymore.
+        //
+        // The only thing we do on an active-device change is the UX
+        // nicety of pulling the user over to the pinned TabFlow tab so
+        // the Resume Working Here modal becomes visible immediately
+        // instead of hiding behind whatever page they're looking at.
+        if (!isActive) {
+          try {
+            const stored = await chrome.storage.local.get('tabFlowTabId');
+            const tfTabId = stored.tabFlowTabId;
+            if (tfTabId) {
+              await chrome.tabs.update(tfTabId, { active: true });
+            }
+          } catch {
+            // Tab may not exist — non-fatal
+          }
+        }
+      }
+    );
+    await syncClient.connect(userId);
+
+    // Initialize device session (checks active device, auto-claims if none)
+    await syncClient.initDeviceSession(deviceId);
+
+    // Store the real user ID for sync pushes
+    syncUserId = userId;
+
+    // Startup pull is deliberately NOT run here. Pull now happens on demand:
+    //   - RESTORE_FROM_CLOUD (explicit user button)
+    //   - CLAIM_ACTIVE_DEVICE (when this device takes over as active)
+    // This avoids pulling every time the service worker wakes up.
+
+    // If this device is the active device, do a full sync push to clean up
+    // any orphaned cloud rows. This runs after every extension reload so the
+    // cloud stays an exact mirror of local state.
+    // Run the safeToPush migration inline first — the deferred setTimeout
+    // runs 1.5s after startup, which is AFTER initializeSync, so without
+    // this the safeToPush check below always fails on first boot.
+    await maybeMigrateSafeToPush();
+    const { isActive: startupActive } = await syncClient.isActiveDeviceFromDb();
+    if (startupActive && (await isSafeToPush())) {
+      try {
+        syncClient.setPushing(true);
+        await syncClient.fullSyncPush(userId);
+        syncClient.setPushing(false);
+        console.log('[TabFlow] Startup full sync push complete');
+      } catch (pushErr) {
+        syncClient.setPushing(false);
+        console.warn('[TabFlow] Startup full sync push failed:', pushErr);
+      }
+    }
+
+    // Mirror cloud preferences (sidebar width, etc.) to chrome.storage.local
+    // so the UI reads from local storage but stays in sync across devices.
+    try {
+      const prefs = await syncClient.getPreferences(userId);
+      const w = (prefs as any)?.sidebarWidth;
+      if (typeof w === 'number') {
+        await chrome.storage.local.set({ tabflow_sidebar_width: w });
+      }
+    } catch (err) {
+      console.warn('[TabFlow] Failed to mirror preferences from cloud:', err);
+    }
+
+    console.log('[TabFlow] Sync initialized for user:', userId);
+  } catch (error) {
+    console.error('[TabFlow] Failed to initialize sync:', error);
+  }
+}
+
+/**
+ * Guard to prevent ensureTabFlowTab from running concurrently.
+ * Both onInstalled and the startup IIFE call it, so without this
+ * they can race each other and create duplicate tabs.
+ */
+let ensureTabFlowRunning = false;
+
+/**
+ * Ensures exactly one TabFlow tab exists, is pinned, and sits at position 0.
+ * Searches ALL windows so duplicates in other windows are caught too.
+ *
+ * 0.1.32: Hardened against the Firefox-extension-update "extra window" bug.
+ * Previously, when the stored tabFlowTabId was stale (which happens on
+ * Firefox auto-update because Firefox reassigns tab IDs), the function
+ * fell through to creating a new TabFlow tab in `chrome.tabs.query({})[0]
+ * .windowId` — which on Firefox can be a window OTHER than the previous
+ * main. The result was a duplicate TabFlow tab in a new window, with the
+ * original main window's workspace tabs hidden behind it. Now we
+ * EXHAUSTIVELY search by URL across all windows before creating, and
+ * only create if no TabFlow tab exists anywhere. When creating, we
+ * prefer chrome.windows.getLastFocused so the new tab lands in the
+ * window the user is actually looking at.
+ */
+async function ensureTabFlowTab() {
+  // Prevent concurrent runs
+  if (ensureTabFlowRunning) {
+    console.log('[TabFlow] ensureTabFlowTab already running, skipping');
+    return;
+  }
+  ensureTabFlowRunning = true;
+
+  try {
+    const extBase = getExtensionBaseUrl(); // chrome-extension://<id>/ or moz-extension://<id>/
+    const suspendedPrefix = `${extBase}suspended.html`;
+    const newtabUrl = getExtensionPageUrl('newtab.html');
+
+    // Search ALL windows for tabs
+    const allTabs = await chrome.tabs.query({});
+    console.log(`[TabFlow] ensureTabFlowTab: found ${allTabs.length} total tabs across all windows`);
+
+    // Helper: does this tab look like a TabFlow tab by URL?
+    const isTabFlowUrl = (t: chrome.tabs.Tab): boolean => {
+      const u = t.url || '';
+      const pu = (t as any).pendingUrl || '';
+      if (u.startsWith(suspendedPrefix) || pu.startsWith(suspendedPrefix)) return false;
+      if (u.startsWith(extBase) || pu.startsWith(extBase)) return true;
+      // chrome://newtab and about:newtab routes are overridden to our
+      // newtab.html — they ARE TabFlow tabs even before the override
+      // has fully rendered.
+      if (u === 'chrome://newtab/' || u === 'chrome://newtab') return true;
+      if (u === 'about:newtab') return true;
+      return false;
+    };
+
+    // Step A: Verify the stored tabFlowTabId, if any. Trust it ONLY if
+    // the live tab's URL still looks like TabFlow. Firefox auto-update
+    // reassigns numeric tab IDs, so a stale stored ID can now point at
+    // an unrelated tab (chrome://extensions, a YouTube tab, etc.).
+    let keeper: chrome.tabs.Tab | null = null;
+    const stored = await chrome.storage.local.get('tabFlowTabId');
+    const storedId: number | undefined = stored?.tabFlowTabId;
+    if (storedId !== undefined) {
+      const candidate = allTabs.find((t) => t.id === storedId) || null;
+      if (candidate && isTabFlowUrl(candidate)) {
+        keeper = candidate;
+        console.log(`[TabFlow] ensureTabFlowTab: stored ID matched, URL ${candidate.url || '(no url)'} (tab ${candidate.id} in window ${candidate.windowId})`);
+      } else if (candidate) {
+        console.log(`[TabFlow] ensureTabFlowTab: stored ID ${storedId} points to unrelated tab (${candidate.url || '(no url)'}), ignoring`);
+        try { await chrome.storage.local.remove('tabFlowTabId'); } catch { /* ignore */ }
+      } else {
+        console.log(`[TabFlow] ensureTabFlowTab: stored ID ${storedId} stale (tab not found), searching by URL`);
+        try { await chrome.storage.local.remove('tabFlowTabId'); } catch { /* ignore */ }
+      }
+    } else {
+      console.log('[TabFlow] ensureTabFlowTab: no stored tabFlowTabId, searching by URL');
+    }
+
+    // Step B: If stored ID didn't yield a keeper, search across ALL
+    // tabs by URL. Prefer explicit extension URL hits over chrome://newtab
+    // ones (they're more reliable signals), and prefer already-pinned
+    // tabs over unpinned ones.
+    if (!keeper) {
+      const byExtUrl = allTabs.filter(
+        (t) => (t.url?.startsWith(extBase) || (t as any).pendingUrl?.startsWith(extBase)) &&
+               !t.url?.startsWith(suspendedPrefix) &&
+               !(t as any).pendingUrl?.startsWith(suspendedPrefix)
+      );
+      const byNewtab = allTabs.filter(
+        (t) => t.url === 'chrome://newtab/' || t.url === 'chrome://newtab' || t.url === 'about:newtab'
+      );
+      const candidates = [...byExtUrl, ...byNewtab];
+      if (candidates.length > 0) {
+        // Prefer pinned, then lowest index. Among ties, the earliest in
+        // the array (which preferred extension-URL over newtab) wins.
+        const sorted = [...candidates].sort((a, b) => {
+          const aPinned = a.pinned ? 0 : 1;
+          const bPinned = b.pinned ? 0 : 1;
+          if (aPinned !== bPinned) return aPinned - bPinned;
+          return (a.index ?? 0) - (b.index ?? 0);
+        });
+        keeper = sorted[0];
+        const windowsFound = Array.from(new Set(candidates.map((t) => t.windowId).filter((w) => w !== undefined)));
+        console.log(`[TabFlow] ensureTabFlowTab: found ${candidates.length} TabFlow tab(s) via URL search across windows [${windowsFound.join(', ')}], keeping tab ${keeper.id} in window ${keeper.windowId}`);
+      }
+    }
+
+    // Pin and position the keeper, or create a new tab
+    if (keeper && keeper.id !== undefined) {
+      // If the keeper is showing chrome://newtab (e.g., after extension reload),
+      // explicitly navigate it to the extension URL. The newtab override SHOULD
+      // handle this, but there's a timing gap where the browser shows the default
+      // new tab page instead of the extension's page. Explicit navigation
+      // guarantees the TabFlow UI is visible.
+      const keeperUrl = keeper.url || '';
+      if (
+        keeperUrl === 'chrome://newtab/' ||
+        keeperUrl === 'chrome://newtab' ||
+        keeperUrl === 'about:newtab' ||
+        keeperUrl === '' ||
+        keeperUrl === 'about:blank'
+      ) {
+        try {
+          await chrome.tabs.update(keeper.id, { url: newtabUrl });
+          console.log('[TabFlow] ensureTabFlowTab: navigated keeper tab to explicit extension URL');
+        } catch (e) {
+          console.warn('[TabFlow] ensureTabFlowTab: could not navigate keeper to extension URL:', e);
+        }
+      }
+
+      if (!keeper.pinned) {
+        await chrome.tabs.update(keeper.id, { pinned: true });
+        console.log(`[TabFlow] ensureTabFlowTab: pinned TabFlow tab ${keeper.id}`);
+      }
+      if (keeper.index !== 0) {
+        try {
+          await chrome.tabs.move(keeper.id, { index: 0 });
+          console.log(`[TabFlow] ensureTabFlowTab: moved TabFlow tab to position 0`);
+        } catch (e) {
+          console.warn('[TabFlow] ensureTabFlowTab: could not move tab to position 0:', e);
+        }
+      }
+      await chrome.storage.local.set({ tabFlowTabId: keeper.id });
+      tabManager.setTabFlowTabId(keeper.id);
+    } else {
+      // No TabFlow tab found anywhere. Truly need to create one.
+      // Pick the window via getLastFocused so the new tab lands in the
+      // window the user is actually looking at, rather than
+      // `chrome.tabs.query({})[0].windowId` (which on Firefox can be a
+      // hidden/minimized window left over from a previous session).
+      let targetWindowId: number | undefined;
+      try {
+        const lastFocused = await chrome.windows.getLastFocused({ populate: false });
+        if (lastFocused?.id !== undefined) {
+          targetWindowId = lastFocused.id;
+        }
+      } catch (e) {
+        console.warn('[TabFlow] ensureTabFlowTab: getLastFocused failed, falling back', e);
+      }
+      if (targetWindowId === undefined) {
+        try {
+          const allWindows = await chrome.windows.getAll();
+          if (allWindows.length > 0 && allWindows[0].id !== undefined) {
+            targetWindowId = allWindows[0].id;
+          }
+        } catch (e) {
+          console.warn('[TabFlow] ensureTabFlowTab: windows.getAll failed', e);
+        }
+      }
+
+      console.log(`[TabFlow] ensureTabFlowTab: no existing TabFlow tab found, creating new one in window ${targetWindowId ?? 'default'}`);
+      const created = await chrome.tabs.create({
+        url: newtabUrl,
+        pinned: true,
+        active: false,
+        ...(targetWindowId !== undefined ? { windowId: targetWindowId } : {}),
+      });
+      if (created.id !== undefined) {
+        try { await chrome.tabs.move(created.id, { index: 0 }); } catch { /* ignore */ }
+        try { await chrome.tabs.update(created.id, { pinned: true }); } catch { /* ignore */ }
+        await chrome.storage.local.set({ tabFlowTabId: created.id });
+        tabManager.setTabFlowTabId(created.id);
+        keeper = created;
+        console.log(`[TabFlow] ensureTabFlowTab: created and pinned TabFlow tab ${created.id} in window ${created.windowId}`);
+      }
+    }
+
+    // 0.1.36: unified pin verification. Every return path must end with
+    // the keeper tab pinned. Firefox session restore can un-pin a tab
+    // mid-startup, and the "stored ID matched" branch above used to skip
+    // the explicit pin call if the live tab already reported pinned=true
+    // at query time. Re-check live and update if needed.
+    if (keeper && keeper.id !== undefined) {
+      try {
+        const live = await chrome.tabs.get(keeper.id);
+        if (!live.pinned) {
+          const updated = await chrome.tabs.update(keeper.id, { pinned: true });
+          if (updated) keeper = updated;
+          console.log(`[TabFlow] ensureTabFlowTab: pin-verify pinned tab ${keeper?.id}`);
+        } else {
+          console.log(`[TabFlow] ensureTabFlowTab: pin-verify tab ${keeper.id} already pinned`);
+        }
+      } catch (err) {
+        console.warn('[TabFlow] ensureTabFlowTab: pin-verify failed:', err);
+      }
+    }
+
+    // Close duplicate TabFlow tabs (extension URL only — not chrome://newtab
+    // tabs which are legitimate user-opened new tabs showing our override page).
+    // 0.1.32: only close clear-extension-URL duplicates. Same-URL chrome://newtab
+    // tabs the user has open are theirs to keep.
+    const keeperId = keeper?.id ?? (await chrome.storage.local.get('tabFlowTabId')).tabFlowTabId;
+    const duplicates = allTabs.filter(
+      (t) => t.id !== keeperId &&
+             t.url?.startsWith(extBase) &&
+             !t.url?.startsWith(suspendedPrefix)
+    );
+    for (const dupe of duplicates) {
+      try {
+        if (dupe.id !== undefined) {
+          await chrome.tabs.remove(dupe.id);
+          console.log(`[TabFlow] ensureTabFlowTab: removed duplicate TabFlow tab ${dupe.id} (was in window ${dupe.windowId})`);
+        }
+      } catch { /* tab may be gone */ }
+    }
+  } catch (error) {
+    console.error('[TabFlow] Error ensuring TabFlow tab:', error);
+  } finally {
+    ensureTabFlowRunning = false;
+  }
+}
+
+/**
+ * On extension install or update — ensure TabFlow tab is pinned
+ */
+chrome.runtime.onInstalled.addListener(async (details) => {
+  console.log(`[TabFlow] Extension ${details.reason}`);
+  if (chrome.sidePanel) {
+    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
+  }
+
+  // Short delay to let Chrome finish its own tab operations
+  setTimeout(async () => {
+    await ensureTabFlowTab();
+    await refreshMainWindowId();
+  }, 500);
+});
+
+/**
+ * One-time migration to deterministic tab IDs (tab-<hash>).
+ *
+ * Background: Pre-migration, tab storage IDs were `chrome-<numericId>` where
+ * the numeric ID came from Chrome's in-memory tab counter. Chrome and
+ * Firefox each count independently from 1, so their IDs inevitably collide
+ * when synced via Supabase. See §9 of CLAUDE.md for the full incident
+ * writeup and the 2026-04-15 rollback.
+ *
+ * This migration walks every workspace's tabs and rewrites non-deterministic
+ * IDs (`chrome-*`, `restart-*`, `moved-*`, `dup-*`) into `tab-<16hex>` where
+ * the hash is computed from (workspaceId, canonicalUrl, createdAt).
+ *
+ * Idempotency: gated by `tabIdMigrationV1Done` in chrome.storage.local. Runs
+ * at most once per extension install.
+ */
+async function migrateTabIdsV1(): Promise<void> {
+  try {
+    const { tabIdMigrationV1Done } = await chrome.storage.local.get('tabIdMigrationV1Done');
+    if (tabIdMigrationV1Done) return;
+
+    console.log('[TabFlow] Tab-ID migration v1 starting');
+    const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+
+    let totalRewritten = 0;
+    let totalUpgradedTabPrefix = 0;
+    let totalSkipped = 0;
+
+    for (const ws of workspaces) {
+      const tabs = await storage.getTabs(ws.id);
+      const sorted = [...tabs].sort(
+        (a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime()
+      );
+
+      const usedIds = new Set<string>(
+        sorted.filter((t) => t.id.startsWith('tab-')).map((t) => t.id)
+      );
+
+      for (const tab of sorted) {
+        const isLegacy =
+          tab.id.startsWith('chrome-') ||
+          tab.id.startsWith('restart-') ||
+          tab.id.startsWith('moved-') ||
+          tab.id.startsWith('dup-');
+
+        if (tab.id.startsWith('tab-')) {
+          if (!tab.createdAt) {
+            await storage.saveTab({ ...tab, createdAt: new Date(tab.updatedAt) });
+            totalUpgradedTabPrefix++;
+          } else {
+            totalSkipped++;
+          }
+          continue;
+        }
+
+        if (!isLegacy) {
+          console.warn(`[TabFlow] Migration: unrecognized tab ID "${tab.id}", skipping`);
+          totalSkipped++;
+          continue;
+        }
+
+        let candidateCreatedAt = new Date(tab.updatedAt);
+        let newId = await computeTabId(ws.id, tab.url, candidateCreatedAt);
+        while (usedIds.has(newId)) {
+          candidateCreatedAt = new Date(candidateCreatedAt.getTime() + 1);
+          newId = await computeTabId(ws.id, tab.url, candidateCreatedAt);
+        }
+        usedIds.add(newId);
+
+        await storage.saveTab({
+          ...tab,
+          id: newId,
+          url: tab.url,
+          createdAt: candidateCreatedAt,
+        });
+        if (tab.id !== newId) {
+          await storage.deleteTab(tab.id);
+        }
+        totalRewritten++;
+      }
+    }
+
+    await chrome.storage.local.set({ tabIdMigrationV1Done: true });
+    console.log(
+      `[TabFlow] Tab-ID migration v1 complete: rewrote ${totalRewritten} legacy records, ` +
+      `backfilled createdAt on ${totalUpgradedTabPrefix} existing tab-* records, ` +
+      `skipped ${totalSkipped}`
+    );
+  } catch (error) {
+    console.error('[TabFlow] Tab-ID migration v1 failed:', error);
+  }
+}
+
+/**
+ * Startup reconciler — the DB-as-truth replacement for the old destructive
+ * `runChromeRestartFlow`.
+ *
+ * Algorithm (idempotent, non-destructive to hidden windows):
+ *   1. Find or create the TabFlow tab (URL-search across all windows).
+ *      That tab's window becomes the "main" window.
+ *   2. Un-minimize the main window if it's minimized.
+ *   3. Close every non-TabFlow tab in the main window.
+ *   4. Read the active workspace from local IndexedDB.
+ *   5. Materialize the active workspace's tabs from the DB via
+ *      `restoreWorkspaceTabs` (which prefers moving from a hidden window
+ *      if one exists — preserves PIP across workspace switches).
+ *   6. Brief settle, then `saveCurrentTabsToWorkspace` so the DB
+ *      faithfully matches the actual browser state.
+ *
+ * Hidden workspace windows for INACTIVE workspaces are deliberately left
+ * alone. They hold inactive workspace tabs with their runtime state
+ * intact, which is what makes PIP-survives-restart possible.
+ */
+async function reconcileToActiveWorkspace(): Promise<void> {
+  console.log('[TabFlow] Startup reconcile: starting');
+
+  await ensureTabFlowTab();
+
+  const stored = await chrome.storage.local.get('tabFlowTabId');
+  const tabFlowTabId: number | undefined = stored?.tabFlowTabId;
+  if (tabFlowTabId === undefined) {
+    console.error('[TabFlow] Startup reconcile: ensureTabFlowTab did not produce a tabFlowTabId, aborting');
+    return;
+  }
+
+  let mainWindowId: number | undefined;
+  try {
+    const tfTab = await chrome.tabs.get(tabFlowTabId);
+    mainWindowId = tfTab.windowId;
+  } catch (err) {
+    console.error('[TabFlow] Startup reconcile: could not resolve TabFlow tab to a window, aborting:', err);
+    return;
+  }
+  if (mainWindowId === undefined) {
+    console.error('[TabFlow] Startup reconcile: TabFlow tab has no windowId, aborting');
+    return;
+  }
+  cachedMainWindowId = mainWindowId;
+
+  // Un-minimize main window if needed
+  try {
+    const win = await chrome.windows.get(mainWindowId);
+    if (win.state === 'minimized') {
+      await chrome.windows.update(mainWindowId, { state: 'normal', focused: true });
+      console.log(`[TabFlow] Startup reconcile: un-minimized main window ${mainWindowId}`);
+    }
+  } catch (err) {
+    console.warn('[TabFlow] Startup reconcile: failed to un-minimize main window:', err);
+  }
+
+  // 0.1.41: Close non-main, non-hidden-workspace windows. Hidden windows in
+  // the `hiddenWindows` map hold workspace tabs preserved for PIP across the
+  // CURRENT browser session. The IIFE runs `reconcileToActiveWorkspace` on
+  // every service-worker wake (MV3 SWs terminate when idle, restart on any
+  // event), so closing them unconditionally — as 0.1.38 did — would kill PIP
+  // on every wake. We only close windows that aren't in the map.
+  //
+  // On real browser restart Firefox reassigns window IDs, so the persisted
+  // map's IDs won't match any restored window; those restored windows get
+  // closed correctly (PIP is not preserved across browser restart, by design).
+  // After the close pass, prune the map of any IDs that no longer exist.
+  try {
+    const stored = await chrome.storage.local.get('hiddenWindows');
+    const hiddenMap = (stored?.hiddenWindows ?? {}) as Record<string, number>;
+    const hiddenWindowIds = new Set<number>(Object.values(hiddenMap));
+
+    const allWindows = await chrome.windows.getAll({ populate: false });
+    for (const win of allWindows) {
+      if (win.id === undefined) continue;
+      if (win.id === mainWindowId) continue;
+      if (hiddenWindowIds.has(win.id)) {
+        console.log(`[TabFlow] Startup reconcile: preserving hidden window ${win.id} (workspace tabs)`);
+        continue;
+      }
+      try {
+        console.log(`[TabFlow] Startup reconcile: closing orphan window ${win.id} (state=${win.state})`);
+        await chrome.windows.remove(win.id);
+      } catch (err) {
+        console.warn(`[TabFlow] Failed to close orphan window ${win.id}:`, err);
+      }
+    }
+
+    // Prune the hiddenWindows map: drop entries whose window IDs no longer
+    // exist (catches stale entries from before this fix and across restart).
+    const allWindowIds = new Set<number>(
+      allWindows.map((w) => w.id).filter((id): id is number => id !== undefined),
+    );
+    const cleanedMap: Record<string, number> = {};
+    for (const [workspaceId, windowId] of Object.entries(hiddenMap)) {
+      if (allWindowIds.has(windowId)) {
+        cleanedMap[workspaceId] = windowId;
+      }
+    }
+    await chrome.storage.local.set({ hiddenWindows: cleanedMap });
+  } catch (err) {
+    console.warn('[TabFlow] Startup reconcile: non-main window cleanup failed:', err);
+  }
+
+  // Close every non-TabFlow tab in the main window
+  const currentTabs = await chrome.tabs.query({ windowId: mainWindowId });
+  const tabsToClose = currentTabs.filter((t) => t.id !== undefined && t.id !== tabFlowTabId);
+  console.log(`[TabFlow] Startup reconcile: closing ${tabsToClose.length} non-TabFlow tabs in main window ${mainWindowId}`);
+  for (const t of tabsToClose) {
+    try {
+      await chrome.tabs.remove(t.id!);
+    } catch (err) {
+      console.warn(`[TabFlow] Startup reconcile: failed to close tab ${t.id}:`, err);
+    }
+  }
+
+  // Read active workspace
+  const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+  const activeWs = workspaces.find((w) => w.isActive);
+  if (!activeWs) {
+    console.log('[TabFlow] Startup reconcile: no active workspace; main window has only TabFlow tab now');
+    return;
+  }
+
+  console.log(`[TabFlow] Startup reconcile: active workspace = ${activeWs.name} (${activeWs.id})`);
+
+  // Materialize workspace's tabs from DB. restoreWorkspaceTabs may prefer
+  // moving from a hidden window if one exists, preserving PIP.
+  const tabsToRestore = await storage.getTabs(activeWs.id);
+  if (tabsToRestore.length > 0) {
+    await tabManager.restoreWorkspaceTabs(tabsToRestore, storage, mainWindowId);
+  }
+
+  // Brief settle so chrome.tabs.query reflects the new state.
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  // Sync DB to actual browser state.
+  await tabManager.saveCurrentTabsToWorkspace(activeWs.id, storage, mainWindowId);
+
+  broadcastSyncUpdate();
+
+  // 0.1.34: run thumbnail backfill inline while the gate is still set
+  // (we're inside the runSystemOperation('startupReconcile', ...) call).
+  // The loading modal stays up until backfill completes.
+  try {
+    await backfillThumbnails(activeWs.id);
+  } catch (err) {
+    console.warn('[TabFlow] Startup reconcile: backfill failed (non-fatal):', err);
+  }
+
+  // 0.1.42: Ensure the TabFlow tab is the active tab so React mounts
+  // immediately, device-status polling fires, and the Resume Working Here
+  // modal (if needed) appears without user intervention. backfillThumbnails
+  // may have activated workspace tabs to capture screenshots and the
+  // "restore originally active tab" logic in there sometimes leaves a
+  // workspace tab active at the end. This is the unconditional final step.
+  try {
+    const stored = await chrome.storage.local.get('tabFlowTabId');
+    const tabFlowTabId = stored?.tabFlowTabId;
+    if (typeof tabFlowTabId === 'number') {
+      await chrome.tabs.update(tabFlowTabId, { active: true });
+      console.log(`[TabFlow] Startup reconcile: activated TabFlow tab ${tabFlowTabId}`);
+    }
+  } catch (err) {
+    console.warn('[TabFlow] Failed to activate TabFlow tab at end of reconcile:', err);
+  }
+
+  console.log(`[TabFlow] Startup reconcile: complete for ${activeWs.name}`);
+}
+
+/**
+ * Pruning alarm — runs once daily to evict old history entries,
+ * archived workspaces, and thumbnail cache overflow.
+ */
+const HISTORY_PRUNE_ALARM_NAME = 'tabflow-history-prune';
+
+/** 30 days in milliseconds */
+const HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** 90 days for deleted workspace archive retention */
+const ARCHIVE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+chrome.alarms.create(HISTORY_PRUNE_ALARM_NAME, {
+  periodInMinutes: 1440,
+  delayInMinutes: 5,
+});
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== HISTORY_PRUNE_ALARM_NAME) return;
+  try {
+    const cutoff = new Date(Date.now() - HISTORY_RETENTION_MS);
+    const deleted = await storage.pruneHistory(cutoff);
+    if (deleted > 0) {
+      console.log(`[TabFlow] Pruned ${deleted} history entries older than 30 days`);
+    }
+    const prunedThumbs = await storage.pruneThumbnails(500);
+    if (prunedThumbs > 0) {
+      console.log(`[TabFlow] Pruned ${prunedThumbs} old thumbnails`);
+    }
+    try {
+      const archiveCutoff = new Date(Date.now() - ARCHIVE_RETENTION_MS);
+      const prunedArchive = await storage.pruneDeletedWorkspaces(archiveCutoff);
+      if (prunedArchive > 0) {
+        console.log(`[TabFlow] Pruned ${prunedArchive} archived workspaces older than 90 days`);
+      }
+    } catch (archiveErr) {
+      console.warn('[TabFlow] Error pruning archived workspaces:', archiveErr);
+    }
+  } catch (err) {
+    console.warn('[TabFlow] Error pruning history/thumbnails:', err);
+  }
+});
+
+/**
+ * Real browser restart. Ensures the reconciler runs even if the IIFE
+ * didn't (which shouldn't happen but is cheap defensively). Idempotent —
+ * the second call is a no-op because the browser already matches the DB
+ * after the first.
+ */
+chrome.runtime.onStartup.addListener(async () => {
+  console.log('[TabFlow] onStartup fired (real browser restart)');
+  try {
+    await runSystemOperation('startupReconcile', async () => {
+      await reconcileToActiveWorkspace();
+    });
+  } catch (err) {
+    console.error('[TabFlow] onStartup reconcile error:', err);
+  }
+});
+
+/**
+ * On service worker startup — preload gate, run migrations, reconcile to
+ * the active workspace, then bring sync/native-host back online.
+ *
+ * The reconciler is the only "startup" logic left. There is no Chrome-restart
+ * detection, no session markers, no version-comparison branches, no
+ * persistent startup-completed flag. Every SW startup just makes the
+ * main window match the DB, idempotently.
+ */
+(async () => {
+  isStartingUp = true;
+  try {
+    // Pre-warm the persisted system-operation gate so synchronous tab
+    // event listeners can check it without awaiting.
+    await preloadGate();
+
+    // 0.1.40: Restore PIP-active tab Set from session storage. Survives
+    // SW sleep so workspace switches after a sleep correctly detect PIP
+    // and route outgoing tabs to a hidden window.
+    await restorePipActiveTabs();
+
+    // One-time migration to deterministic tab IDs.
+    await migrateTabIdsV1();
+
+    // Wait for Firefox session restore (and any other in-flight tab
+    // creation) to quiesce before running the reconciler. Replaces the
+    // old fixed 200ms wait, which fired before Firefox finished
+    // restoring tabs and let stray session-restored tabs slip past
+    // the reconciler.
+    await waitForTabsToSettle();
+
+    await runSystemOperation('startupReconcile', async () => {
+      console.log('[TabFlow] IIFE: starting reconcileToActiveWorkspace');
+      await reconcileToActiveWorkspace();
+      console.log('[TabFlow] IIFE: reconcileToActiveWorkspace complete');
+    });
+  } catch (err) {
+    console.error('[TabFlow] IIFE startup reconcile error:', err);
+  } finally {
+    isStartingUp = false;
+    console.log('[TabFlow] IIFE startup complete');
+  }
+
+  // Native host (hides windows from taskbar). Non-blocking — if the host
+  // isn't installed, hidden windows just stay visible.
+  try {
+    await tabManager.initNativeHost();
+
+    setTimeout(async () => {
+      await tabManager.ensureMainWindowVisible();
+    }, 2500);
+
+    setTimeout(async () => {
+      await tabManager.rehideInactiveWorkspaceWindows();
+    }, 500);
+  } catch (e) {
+    console.log('[TabFlow] Native host init skipped:', e);
+  }
+
+  // Resume sync if the user is signed in.
+  try {
+    const session = await AuthManager.getSession();
+    if (session) {
+      console.log('[TabFlow] Resuming sync for existing session, user:', session.user.email);
+      await initializeSync(session.user.id);
+    } else {
+      console.log('[TabFlow] No auth session found — user not logged in or session expired');
+    }
+  } catch (e) {
+    console.warn('[TabFlow] Auth session check failed:', e);
+  }
+})();
+
+/**
+ * Handle MOVE_TABS entirely in the service worker.
+ *
+ * STRATEGY: "Snapshot → Write new → Delete old → Close Chrome tab (async)"
+ * We write the new records FIRST, respond to the UI immediately,
+ * then close the Chrome tabs asynchronously afterward.
+ */
+async function handleMoveTabsInServiceWorker(payload: any): Promise<Response> {
+  const { tabIds, targetWorkspaceId } = payload || {};
+  if (!tabIds?.length) return { success: false, error: 'tabIds is required' };
+  if (!targetWorkspaceId) return { success: false, error: 'targetWorkspaceId is required' };
+
+  const targetWorkspace = await storage.getWorkspace(targetWorkspaceId);
+  if (!targetWorkspace) return { success: false, error: 'Target workspace not found' };
+
+  // Phase 1 refactor: gate the ENTIRE operation (snapshot, write new records,
+  // delete old records, broadcast, AND close Chrome tabs) inside a single
+  // runSystemOperation wrapper. Previous code used nested setTimeouts to
+  // gate the chrome.tabs.remove() call, which could leak the in-memory
+  // isSwitchingWorkspaces flag if the SW was suspended between timeouts.
+  // The new persisted gate auto-clears in the finally block (and via the
+  // 60s max-lifetime safety net).
+  return await runSystemOperation('handleMoveTabsInServiceWorker', async () => {
+    // Step 1: Snapshot the tab data and create new records in target workspace
+    const allWorkspaces = await storage.getWorkspaces(LOCAL_USER_ID);
+    const tabIdSet = new Set(tabIds as string[]);
+    const chromeIdsToClose: number[] = [];
+    const now = Date.now();
+    const existingTargetTabs = await storage.getTabs(targetWorkspaceId);
+    let startOrder = existingTargetTabs.length;
+    let movedCount = 0;
+
+    // Deterministic storage IDs no longer embed a Chrome numeric tab ID, so
+    // we match tiles to live Chrome tabs by canonical URL instead.
+    const urlIndex = await tabManager.buildMainWindowUrlIndex();
+
+    for (const ws of allWorkspaces) {
+      const wsTabs = await storage.getTabs(ws.id);
+      for (const tab of wsTabs) {
+        if (tabIdSet.has(tab.id)) {
+          // Create a NEW record in the target workspace
+          const newId = `moved-${now}-${movedCount}`;
+          await storage.saveTab({
+            id: newId,
+            workspaceId: targetWorkspaceId,
+            url: tab.url,
+            title: tab.title,
+            faviconUrl: tab.faviconUrl,
+            sortOrder: startOrder + movedCount,
+            isPinned: tab.isPinned,
+            lastAccessed: new Date(),
+            updatedAt: new Date(),
+          });
+          console.log(`[TabFlow] Move: created ${newId} for "${tab.title}" in ${targetWorkspaceId}`);
+          movedCount++;
+
+          const canonical = canonicalizeUrl(tab.url);
+          const chromeIds = urlIndex.get(canonical);
+          if (chromeIds && chromeIds.length > 0) {
+            chromeIdsToClose.push(chromeIds.shift()!);
+          }
+        }
+      }
+    }
+
+    if (movedCount === 0) {
+      return { success: false, error: 'No matching tabs found' };
+    }
+
+    // Step 2: Delete the original records
+    for (const tabId of tabIds) {
+      await storage.deleteTab(tabId);
+      console.log(`[TabFlow] Move: deleted original record ${tabId}`);
+    }
+
+    // Step 3: Broadcast update so the UI refreshes
+    broadcastSyncUpdate();
+
+    // Step 4: Close the corresponding Chrome tabs. Awaited (not fire-and-forget)
+    // so the gate stays up through the chrome.tabs.remove event storm; otherwise
+    // the resulting onRemoved events could trigger a snapshot that races our
+    // new records. The gate clears via runSystemOperation's finally.
+    if (chromeIdsToClose.length > 0) {
+      try {
+        await chrome.tabs.remove(chromeIdsToClose);
+        console.log(`[TabFlow] Move: closed ${chromeIdsToClose.length} Chrome tabs`);
+      } catch (e) {
+        console.warn('[TabFlow] Move: error closing Chrome tabs:', e);
+      }
+      // Let any straggling tab events settle while the gate is still up.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    refreshMainWindowId();
+    broadcastSyncUpdate();
+
+    // Phase 2 (gate-hardening): final reconcile against the SOURCE
+    // workspace (the active workspace whose tabs were closed). The
+    // destination workspace's records were written directly above and
+    // its tabs aren't in the live window, so reconciling there would
+    // delete the fresh records. Reconcile the active workspace to clean
+    // up any lingering records for tabs we just closed.
+    try {
+      const wsList = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+      const activeWs = wsList.find((ws) => ws.isActive);
+      if (activeWs) {
+        await finalReconcile(activeWs.id, 'handleMoveTabsInServiceWorker');
+      }
+    } catch (reconErr) {
+      console.warn('[TabFlow] Move: finalReconcile lookup failed (non-fatal):', reconErr);
+    }
+
+    return { success: true, data: { movedCount, targetWorkspaceId } };
+  });
+}
+
+/**
+ * MESSAGE-TRIGGERED STARTUP — the most reliable MV3 startup mechanism.
+ *
+ * Problem: After Chrome restart with profile picker, the service worker
+ * starts, goes idle, gets killed, and both setTimeout and chrome.alarms
+ * are unreliable. But when the user clicks "+" to open a new tab, the
+ * TabFlow UI loads and sends GET_WORKSPACES — this ALWAYS wakes the
+ * service worker and delivers a message.
+ *
+ * Solution: Before handling ANY message, check if there's a pending
+ * Chrome restart. If so, run the full startup flow (pin TabFlow tab,
+ * reconcile stale IDs) BEFORE responding. This guarantees the startup
+ * flow completes before the UI gets any data.
+ */
+async function ensureStartupComplete(): Promise<void> {
+  // In the DB-as-truth model there is no destructive Chrome-restart flow
+  // to wait on. The IIFE runs `reconcileToActiveWorkspace()` and clears
+  // `isStartingUp` when done; this helper just blocks until that happens.
+  // If the worker was killed and a message comes in before the IIFE
+  // finishes, message handlers wait here briefly until the reconcile is
+  // complete (or 5s passes, after which we proceed regardless).
+  const deadline = Date.now() + 5000;
+  while (isStartingUp && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/**
+ * Message listener — routes popup/sidebar messages to handlers
+ */
+chrome.runtime.onMessage.addListener(
+  (message: Message & { type: string }, sender, sendResponse: (response: Response) => void) => {
+    // MESSAGE-TRIGGERED STARTUP: Before handling ANY message, ensure the
+    // Chrome restart flow has completed. This is the primary mechanism for
+    // reliable startup after Chrome restart + profile picker.
+    // We wrap the entire handler in an async IIFE that awaits startup first.
+    (async () => {
+      try {
+        // Run startup flow if needed (no-op if already complete)
+        await ensureStartupComplete();
+
+        // Handle AUTH_READY from popup after login
+        if (message.type === 'AUTH_READY' && message.payload?.userId) {
+          await initializeSync(message.payload.userId);
+          sendResponse({ success: true });
+          return;
+        }
+
+        // Handle SIGN_OUT
+        if (message.type === 'SIGN_OUT') {
+          if (syncClient) {
+            syncClient.disconnect();
+            syncClient = null;
+          }
+          sendResponse({ success: true });
+          return;
+        }
+
+        // Handle CAPTURE_MISSING_THUMBNAILS — try to capture the active tab if missing
+        if (message.type === 'CAPTURE_MISSING_THUMBNAILS') {
+          captureActiveIfMissing().catch(console.error);
+          sendResponse({ success: true });
+          return;
+        }
+
+        // Persist a UI preference value to user_settings.preferences. The
+        // value is also written to chrome.storage.local separately by the
+        // newtab page so reads are local; this handler only does the cloud
+        // round-trip for cross-device sync.
+        if (message.type === 'SAVE_SIDEBAR_WIDTH') {
+          const width = message.payload?.width;
+          if (typeof width === 'number' && syncClient && syncUserId) {
+            try {
+              await syncClient.setPreferences(syncUserId, { sidebarWidth: width });
+            } catch (err) {
+              console.warn('[TabFlow] SAVE_SIDEBAR_WIDTH push failed:', err);
+            }
+          }
+          sendResponse({ success: true });
+          return;
+        }
+
+        // ─── SCROLL POSITION (from scroll-tracker content script) ────
+        // Supabase is the ONLY source of truth for scroll position.
+        // No cache, no IndexedDB middleman. User scrolls → push to Supabase.
+        if (message.type === 'SAVE_SCROLL_POSITION') {
+          const scrollX = message.payload?.scrollX ?? 0;
+          const scrollY = message.payload?.scrollY ?? 0;
+          const tabUrl = sender.tab?.url;
+          if (tabUrl && syncClient && syncUserId) {
+            try {
+              const safe = await isSafeToPush();
+              if (safe) {
+                const canonical = canonicalizeUrl(tabUrl);
+                const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+                const activeWs = workspaces.find((ws) => ws.isActive);
+                if (activeWs) {
+                  const tabs = await storage.getTabs(activeWs.id);
+                  const match = tabs.find((t: any) => canonicalizeUrl(t.url) === canonical);
+                  if (match) {
+                    // Push scroll directly to Supabase — skip isActiveDevice gate
+                    // because scroll updates are safe from any device (they only
+                    // update an existing row's scroll_x/scroll_y columns).
+                    syncClient.setPushing(true);
+                    try {
+                      await syncClient.pushTab({ ...match, scrollX, scrollY });
+                    } finally {
+                      syncClient.setPushing(false);
+                    }
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn(`[TabFlow] Scroll push error:`, err);
+            }
+          }
+          sendResponse({ success: true });
+          return;
+        }
+
+        // Supabase is the ONLY source of truth for scroll position.
+        // No cache, no IndexedDB. Tab opens or becomes visible → ask Supabase.
+        if (message.type === 'GET_SCROLL_POSITION') {
+          try {
+            const tabUrl = sender.tab?.url || sender.url;
+            if (tabUrl && syncClient) {
+              const canonical = canonicalizeUrl(tabUrl);
+              const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+              const activeWs = workspaces.find((ws) => ws.isActive);
+              if (activeWs) {
+                const tabs = await storage.getTabs(activeWs.id);
+                const match = tabs.find((t: any) => canonicalizeUrl(t.url) === canonical);
+                if (match) {
+                  const { data } = await syncClient.getTabScroll(match.id);
+                  if (data && (data.scroll_x != null || data.scroll_y != null)) {
+                    sendResponse({
+                      scrollX: data.scroll_x ?? 0,
+                      scrollY: data.scroll_y ?? 0,
+                    });
+                    return;
+                  }
+                }
+              }
+            }
+            sendResponse({ scrollX: null, scrollY: null });
+          } catch {
+            sendResponse({ scrollX: null, scrollY: null });
+          }
+          return;
+        }
+
+        // Handle GET_THUMBNAILS directly in service worker (needs IndexedDB-specific API)
+        // Thumbnails are now keyed by storage tab ID (not URL) — see the
+        // captureVisibleTab path below. Multiple tabs sharing the same URL
+        // (e.g., several YouTube homepage tabs) each get their own
+        // thumbnail entry.
+        if (message.type === 'GET_THUMBNAILS') {
+          try {
+            // Accept both `tabIds` (current) and `urls` (legacy callers).
+            // The storage method signature is the same — just key lookups.
+            const ids = message.payload?.tabIds ?? message.payload?.urls;
+            if (!ids?.length) {
+              sendResponse({ success: true, data: {} });
+              return;
+            }
+            const thumbnails = await storage.getThumbnails(ids);
+            sendResponse({ success: true, data: thumbnails });
+          } catch (err) {
+            sendResponse({ success: false, error: 'Failed to get thumbnails' });
+          }
+          return;
+        }
+
+        // Handle GET_WORKSPACE_STATS — per-workspace memory and tab info
+        if (message.type === 'GET_WORKSPACE_STATS') {
+          try {
+            const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+            const mainWindowId = cachedMainWindowId ?? await tabManager.getMainWindowId();
+            const hiddenMap = await tabManager.getHiddenWindowMap();
+
+            // Get all windows' tabs in one query
+            const allTabs = await chrome.tabs.query({});
+
+            // Build stats per workspace (tab count + audible indicators)
+            const stats: Record<string, { tabCount: number; audibleCount: number }> = {};
+
+            for (const ws of workspaces) {
+              let windowId: number | undefined;
+              let wsTabs: chrome.tabs.Tab[] = [];
+
+              if (ws.isActive && mainWindowId) {
+                windowId = mainWindowId;
+              } else if (hiddenMap[ws.id]) {
+                windowId = hiddenMap[ws.id];
+              }
+
+              if (windowId) {
+                wsTabs = allTabs.filter((t) => t.windowId === windowId && !tabManager.isTabFlowTab(t));
+              }
+
+              let audibleCount = 0;
+              for (const tab of wsTabs) {
+                if (tab.audible) audibleCount++;
+              }
+
+              stats[ws.id] = {
+                tabCount: wsTabs.length || (await storage.getTabs(ws.id)).length,
+                audibleCount,
+              };
+            }
+
+            // ─── Memory stats ─────────────────────────────────────────
+            //
+            // Two numbers are reported back to the UI:
+            //   totalSystemMemory / availableMemory  — physical RAM totals
+            //   chromeMemoryBytes                    — working set of the
+            //                                           browser's own processes
+            //                                           (column label "Chrome"
+            //                                           on Chrome, "Firefox" on
+            //                                           Firefox; the UI picks
+            //                                           the label based on its
+            //                                           build target)
+            //
+            // Sources:
+            //   - System memory on Chrome: chrome.system.memory.getInfo()
+            //   - System memory on Firefox: native host "get_system_memory"
+            //     action (Firefox has no browser.system.memory API).
+            //   - Browser process memory on both: native host
+            //     "get_browser_memory" action with processName set to the
+            //     current browser's process (chrome / firefox).
+            //
+            // If the native host isn't installed, these degrade gracefully —
+            // system memory still works on Chrome (via the system.memory
+            // permission), but on Firefox the whole block is skipped by the UI
+            // (memoryBlock is hidden when totalSystemMemory is 0).
+
+            let totalSystemMemory = 0;
+            let availableMemory = 0;
+            let chromeMemoryBytes = 0;
+
+            // 1. System memory via chrome.system.memory (Chrome only).
+            try {
+              if (chrome.system?.memory?.getInfo) {
+                const memInfo = await chrome.system.memory.getInfo();
+                totalSystemMemory = memInfo.capacity || 0;
+                availableMemory = memInfo.availableCapacity || 0;
+              }
+            } catch { /* not available */ }
+
+            // Helper: one-shot native messaging request with graceful fallback.
+            const sendNative = (payload: any): Promise<any> =>
+              new Promise((resolve) => {
+                try {
+                  chrome.runtime.sendNativeMessage(
+                    'com.tabflow.host',
+                    payload,
+                    (resp) => {
+                      if (chrome.runtime.lastError) resolve(null);
+                      else resolve(resp);
+                    }
+                  );
+                } catch {
+                  resolve(null);
+                }
+              });
+
+            // 2. Firefox: system memory via the native host.
+            if (totalSystemMemory === 0) {
+              const sysResp: any = await sendNative({ action: 'get_system_memory' });
+              if (sysResp?.success && typeof sysResp.totalBytes === 'number') {
+                totalSystemMemory = sysResp.totalBytes;
+                availableMemory = sysResp.availableBytes || 0;
+              }
+            }
+
+            // 3. Browser process memory via the native host (both browsers).
+            //    processName matches Windows' Process.GetProcessesByName —
+            //    "chrome" covers every chrome.exe child; "firefox" covers
+            //    firefox.exe (parent + every tab/content process).
+            const procName = isFirefox ? 'firefox' : 'chrome';
+            const procResp: any = await sendNative({
+              action: 'get_browser_memory',
+              processName: procName,
+            });
+            if (procResp?.success && typeof procResp.memoryBytes === 'number') {
+              chromeMemoryBytes = procResp.memoryBytes;
+            }
+
+            sendResponse({
+              success: true,
+              data: { stats, totalSystemMemory, availableMemory, chromeMemoryBytes },
+            });
+          } catch (err) {
+            sendResponse({ success: false, error: 'Failed to get stats' });
+          }
+          return;
+        }
+
+        // ─── DEVICE SESSION MANAGEMENT ─────────────────────────────
+        //
+        // CLAIM_ACTIVE_DEVICE does a full materialization-verified claim:
+        //
+        //   1. pullAll from Supabase into IndexedDB (additive upsert).
+        //   2. Optionally save the current browser window's tabs to a new
+        //      "Recovered from {Browser}" workspace (mode: 'save-first').
+        //   3. Hold isSwitchingWorkspaces = true during the reshuffle so
+        //      snapshots can't fire.
+        //   4. Close all main-window tabs except the pinned TabFlow newtab.
+        //   5. Open the active workspace's tabs in sort_order.
+        //   6. Wait a settle window.
+        //   7. Re-snapshot the active workspace so IndexedDB matches window.
+        //   8. Verify: canonicalized URL set from window == IndexedDB tabs
+        //      for the active workspace. If diverged, fall back to option C:
+        //      auto-save the current browser tabs to a Recovered workspace
+        //      so nothing is truly lost, THEN abort the claim.
+        //   9. claimActiveDevice() + start heartbeat.
+        //  10. markSafeToPush so explicit actions begin syncing.
+        //
+        // Only after step 10 is the safeToPush gate open. Steps 1-9 run
+        // under isSwitchingWorkspaces = true so snapshots and their push
+        // path are doubly gated.
+        if (message.type === 'CLAIM_ACTIVE_DEVICE') {
+          try {
+            // Wait up to 5s for the SW's async sync init to finish. The
+            // user shouldn't see "sync not ready" just because they
+            // clicked Resume a moment after Firefox started.
+            await waitForSyncReady();
+            if (!syncClient || !syncUserId) {
+              sendResponse({
+                success: false,
+                error: 'Sync not initialized — please sign in or check connection',
+              });
+              return;
+            }
+
+            const result = await claimActiveDeviceWithMaterialization();
+            if (result.success) {
+              broadcastSyncUpdate();
+            }
+            sendResponse(result);
+          } catch (err) {
+            console.error('[TabFlow] Failed to claim active device:', err);
+            sendResponse({ success: false, error: 'Failed to claim active device' });
+          }
+          return;
+        }
+
+        if (message.type === 'GET_DEVICE_STATUS') {
+          // The database is the single source of truth for device status.
+          // Every call round-trips to Supabase — no caches, no fallbacks,
+          // no "assume active" defaults. If we can't reach the DB or sync
+          // isn't set up yet, we report `success: false` so the UI can
+          // retry on its next poll rather than rendering a stale answer.
+          try {
+            if (!syncClient) {
+              sendResponse({ success: false, error: 'sync_not_ready' });
+              return;
+            }
+            const { isActive, claimedBy } = await syncClient.isActiveDeviceFromDb();
+            sendResponse({
+              success: true,
+              data: { isActive, claimedBy: claimedBy ?? null },
+            });
+          } catch (err) {
+            console.warn('[TabFlow] GET_DEVICE_STATUS failed:', err);
+            sendResponse({ success: false, error: 'db_query_failed' });
+          }
+          return;
+        }
+
+        if (message.type === 'GET_OPERATION_STATUS') {
+          // Phase 3 read-only access to the SystemOperationGate's current
+          // state. Used by the new-tab page's polling loop to render the
+          // floating loading overlay during a system operation (workspace
+          // switch, history restore, claim materialization, move tabs,
+          // Chrome-restart flow). Read-only — never mutates the gate.
+          try {
+            const state = await getGateStateRaw();
+            sendResponse({ success: true, data: state });
+          } catch (err) {
+            console.warn('[TabFlow] GET_OPERATION_STATUS failed:', err);
+            sendResponse({ success: false, error: 'gate_read_failed' });
+          }
+          return;
+        }
+
+        if (message.type === 'PIP_STATE_CHANGED') {
+          // 0.1.38: pip-tracker content script reports a tab entering or
+          // leaving Picture-in-Picture. Maintain pipActiveTabs so
+          // handleSwitchWorkspace can decide whether to preserve outgoing
+          // tabs via a hidden minimized window (PIP active) or just close
+          // them (no PIP).
+          try {
+            const tabId = sender?.tab?.id;
+            if (tabId !== undefined) {
+              if (message.payload?.hasPip) {
+                pipActiveTabs.add(tabId);
+                console.log(`[TabFlow] PIP started on tab ${tabId}`);
+              } else {
+                pipActiveTabs.delete(tabId);
+                console.log(`[TabFlow] PIP ended on tab ${tabId}`);
+              }
+              // 0.1.40: persist so SW sleep can't lose the state.
+              await persistPipActiveTabs();
+            }
+            sendResponse({ success: true });
+          } catch (err) {
+            console.warn('[TabFlow] PIP_STATE_CHANGED handler error:', err);
+            sendResponse({ success: false });
+          }
+          return;
+        }
+
+        // ─── ONE-TIME RESTORE FROM CLOUD ───────────────────────────
+        // Explicit user-triggered pull. Fetches all encrypted workspaces
+        // and tabs from Supabase, decrypts with the passphrase-derived key,
+        // and writes them into this install's IndexedDB. Safe because:
+        //   (a) only runs when the user clicks "Restore from Cloud"
+        //   (b) push still requires active-device + user actions — this
+        //       does not push anything back
+        //   (c) saveWorkspace/saveTab upsert by id so re-running is idempotent
+        if (message.type === 'RESTORE_FROM_CLOUD') {
+          try {
+            // Wait for async sync init before erroring out.
+            await waitForSyncReady();
+            if (!syncClient || !syncUserId) {
+              sendResponse({
+                success: false,
+                error: 'Sync not initialized — please sign in or check connection',
+              });
+              return;
+            }
+            // Temporarily suppress the realtime push echo guard so the
+            // pulled rows go straight into storage.
+            syncClient.setPushing(true);
+            await syncClient.pullAll(syncUserId, true /* destructive */);
+            syncClient.setPushing(false);
+
+            // Count what we now have locally so the UI can confirm.
+            const workspaces = await storage.getWorkspaces(LOCAL_USER_ID);
+            let tabCount = 0;
+            for (const ws of workspaces) {
+              const tabs = await storage.getTabs(ws.id);
+              tabCount += tabs.length;
+            }
+            // Explicit user-triggered pull — safe to push from here on.
+            await markSafeToPush('restore from cloud');
+            broadcastSyncUpdate();
+            sendResponse({
+              success: true,
+              data: { workspaceCount: workspaces.length, tabCount },
+            });
+          } catch (err) {
+            if (syncClient) syncClient.setPushing(false);
+            console.error('[TabFlow] Restore from cloud failed:', err);
+            // DOMException from Web Crypto means the passphrase-derived key
+            // cannot decrypt the cloud ciphertext — almost always a passphrase
+            // mismatch on this install.
+            let msg: string;
+            if (err instanceof DOMException || (err as any)?.name === 'OperationError') {
+              msg =
+                'Decryption failed. The passphrase on this install does not match ' +
+                'the passphrase used to encrypt your cloud data. Sign out and sign ' +
+                'in again, entering the ORIGINAL passphrase when prompted.';
+            } else if (err instanceof Error) {
+              msg = err.message;
+            } else {
+              msg = `Restore failed: ${String(err)}`;
+            }
+            sendResponse({ success: false, error: msg });
+          }
+          return;
+        }
+
+        // Handle MOVE_TABS entirely in the service worker so we have direct
+        // control over isSwitchingWorkspaces.
+        if (message.type === 'MOVE_TABS') {
+          const response = await handleMoveTabsInServiceWorker(message.payload);
+          if (syncClient && response.success) {
+            pushToSync(message, response.data).catch(console.error);
+          }
+          sendResponse(response);
+          return;
+        }
+
+        // Handle DUPLICATE_TABS — copy tabs to another workspace without removing originals
+        if (message.type === 'DUPLICATE_TABS') {
+          try {
+            const { tabIds, targetWorkspaceId } = message.payload || {};
+            if (!tabIds?.length) { sendResponse({ success: false, error: 'tabIds is required' }); return; }
+            if (!targetWorkspaceId) { sendResponse({ success: false, error: 'targetWorkspaceId is required' }); return; }
+
+            const targetWorkspace = await storage.getWorkspace(targetWorkspaceId);
+            if (!targetWorkspace) { sendResponse({ success: false, error: 'Target workspace not found' }); return; }
+
+            const allWorkspaces = await storage.getWorkspaces(LOCAL_USER_ID);
+            const tabIdSet = new Set(tabIds as string[]);
+            const now = Date.now();
+            const existingTargetTabs = await storage.getTabs(targetWorkspaceId);
+            let startOrder = existingTargetTabs.length;
+            let dupCount = 0;
+
+            for (const ws of allWorkspaces) {
+              const wsTabs = await storage.getTabs(ws.id);
+              for (const tab of wsTabs) {
+                if (tabIdSet.has(tab.id)) {
+                  const newId = `dup-${now}-${dupCount}`;
+                  await storage.saveTab({
+                    id: newId,
+                    workspaceId: targetWorkspaceId,
+                    url: tab.url,
+                    title: tab.title,
+                    faviconUrl: tab.faviconUrl,
+                    sortOrder: startOrder + dupCount,
+                    isPinned: tab.isPinned,
+                    lastAccessed: new Date(),
+                    updatedAt: new Date(),
+                  });
+                  console.log(`[TabFlow] Duplicate: created ${newId} for "${tab.title}" in ${targetWorkspaceId}`);
+                  dupCount++;
+                }
+              }
+            }
+
+            if (dupCount === 0) {
+              sendResponse({ success: false, error: 'No matching tabs found' });
+              return;
+            }
+
+            broadcastSyncUpdate();
+            sendResponse({ success: true, data: { duplicatedCount: dupCount } });
+          } catch (err) {
+            console.error('[TabFlow] Duplicate tabs error:', err);
+            sendResponse({ success: false, error: 'Failed to duplicate tabs' });
+          }
+          return;
+        }
+
+        // Message types that modify data and should be synced to Supabase
+        const SYNC_WRITE_TYPES = new Set([
+          'CREATE_WORKSPACE',
+          'DELETE_WORKSPACE',
+          'SWITCH_WORKSPACE',
+          'REMOVE_TAB',
+          'RENAME_WORKSPACE',
+          'CHANGE_WORKSPACE_COLOR',
+          'REORDER_WORKSPACES',
+        ]);
+
+        // Route all other messages through MessageHandler
+        const response = await messageHandler.handleMessage(message);
+        // After local write, push to sync if connected (skip read-only operations)
+        if (syncClient && response.success && SYNC_WRITE_TYPES.has(message.type)) {
+          pushToSync(message, response.data).catch(console.error);
+        }
+        sendResponse(response);
+      } catch (error) {
+        console.error('[TabFlow] Error in onMessage handler:', error);
+        sendResponse({ success: false, error: 'Failed to handle message' });
+      }
+    })();
+
+    return true; // async response
+  }
+);
+
+/**
+ * Pull from cloud, make the browser match, then claim as active device.
+ *
+ * Simple flow:
+ * 1. Pull all workspaces + tabs from Supabase into IndexedDB
+ * 2. Close whatever tabs are in the browser (we don't care about them)
+ * 3. Open the active workspace's tabs
+ * 4. Claim this device as active and enable push
+ */
+async function claimActiveDeviceWithMaterialization(): Promise<{ success: boolean; error?: string }> {
+  // Belt-and-suspenders: the CLAIM_ACTIVE_DEVICE handler already waits, but
+  // this function is also reachable from other paths in the future, and the
+  // wait is cheap when sync is already ready (returns immediately).
+  await waitForSyncReady();
+  if (!syncClient || !syncUserId) {
+    return {
+      success: false,
+      error: 'Sync not initialized — please sign in or check connection',
+    };
+  }
+
+  return await runSystemOperation('claimActiveDeviceWithMaterialization', async () => {
+  // ── Step 1: Destructive pull — clear local data, then pull from cloud ──
+  // This gives us an exact mirror of the cloud with no leftover junk.
+  try {
+    syncClient.setPushing(true);
+    await syncClient.pullAll(syncUserId, true /* destructive */);
+
+    // 0.1.37: also pull history, archive, and preferences. Each is wrapped
+    // in its own try/catch — an individual pull failure shouldn't break
+    // the whole claim, since workspaces+tabs (the must-have data) already
+    // succeeded above.
+    try {
+      await (storage as any).clearWorkspaceHistory?.();
+      const cloudHistory = await syncClient.pullHistory(syncUserId);
+      for (const entry of cloudHistory) {
+        await storage.saveHistoryEntry(entry);
+      }
+      console.log(`[TabFlow] Pulled ${cloudHistory.length} history entries`);
+    } catch (histPullErr) {
+      console.warn('[TabFlow] History pull failed (non-fatal):', histPullErr);
+    }
+    try {
+      await (storage as any).clearDeletedWorkspaces?.();
+      const cloudArchive = await syncClient.pullDeletedWorkspaces(syncUserId);
+      for (const entry of cloudArchive) {
+        await (storage as any).archiveWorkspace(entry);
+      }
+      console.log(`[TabFlow] Pulled ${cloudArchive.length} archived workspaces`);
+    } catch (archivePullErr) {
+      console.warn('[TabFlow] Archive pull failed (non-fatal):', archivePullErr);
+    }
+    try {
+      const prefs = await syncClient.getPreferences(syncUserId);
+      const sw = (prefs as any)?.sidebarWidth;
+      if (typeof sw === 'number') {
+        await chrome.storage.local.set({ tabflow_sidebar_width: sw });
+        console.log(`[TabFlow] Pulled sidebar width from cloud: ${sw}`);
+      }
+    } catch (prefsPullErr) {
+      console.warn('[TabFlow] Preferences pull failed (non-fatal):', prefsPullErr);
+    }
+  } catch (pullErr) {
+    syncClient.setPushing(false);
+    if (pullErr instanceof DOMException || (pullErr as any)?.name === 'OperationError') {
+      return {
+        success: false,
+        error:
+          'Decryption failed during pull. The passphrase on this install does ' +
+          'not match the cloud data. Sign out and sign in again with the ' +
+          'original passphrase.',
+      };
+    }
+    console.error('[TabFlow] Pull-on-claim failed, aborting claim:', pullErr);
+    return {
+      success: false,
+      error: 'Failed to pull from cloud. Check your network and try again.',
+    };
+  } finally {
+    syncClient.setPushing(false);
+  }
+
+  // Lock snapshots while we reshuffle the window.
+  isSwitchingWorkspaces = true;
+
+  try {
+    const mainWindowId = await tabManager.getMainWindowId();
+    if (mainWindowId === undefined) {
+      return { success: false, error: 'Main window not found' };
+    }
+
+    // ── Step 2: Find the active workspace ───────────────────────────
+    const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+    const activeWorkspace = workspaces.find((ws) => ws.isActive) || workspaces[0];
+    if (!activeWorkspace) {
+      return { success: false, error: 'No workspaces found after pull' };
+    }
+
+    // ── Step 3: Make the browser match the database ─────────────────
+    await tabManager.closeAllTabs();
+    const workspaceTabs = await storage.getTabs(activeWorkspace.id);
+
+    await tabManager.restoreWorkspaceTabs(workspaceTabs, storage, mainWindowId);
+
+    // Brief settle for tabs to commit
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Phase 2 (gate-hardening): finalReconcile replaces the old explicit
+    // re-snapshot. Same effect (saveCurrentTabsToWorkspace against the
+    // active workspace), but with an extra 200ms settle baked in and the
+    // gate still set so no other code path can race the write.
+    await finalReconcile(activeWorkspace.id, 'claimActiveDeviceWithMaterialization');
+
+    // Tell the UI to re-fetch workspaces/tabs NOW — before the
+    // potentially slow cloud push. Without this, the sidebar stays
+    // on the old workspace until the full sync push finishes (~10s).
+    broadcastSyncUpdate();
+
+    // 0.1.34: run thumbnail backfill inline while the gate is still set.
+    // The loading modal stays up; user clicks can't race tab activations.
+    try {
+      await backfillThumbnails(activeWorkspace.id);
+    } catch (err) {
+      console.warn('[TabFlow] Claim: backfill failed (non-fatal):', err);
+    }
+
+    // ── Step 4: Claim on Supabase and enable push ───────────────────
+    await syncClient.claimActiveDevice();
+    await markSafeToPush('claim completed');
+
+    // ── Step 5: Full sync push — clean up orphaned cloud rows ───────
+    // Now that this device is active, make the cloud an exact mirror
+    // of our local state. This deletes stale workspaces/tabs that
+    // accumulated in the cloud from earlier corruption or other browsers.
+    try {
+      await syncClient.fullSyncPush(syncUserId);
+    } catch (pushErr) {
+      // Non-fatal — the cloud may have some junk but we're functional
+      console.warn('[TabFlow] Full sync push after claim failed:', pushErr);
+    }
+
+    return { success: true };
+  } finally {
+    isSwitchingWorkspaces = false;
+    refreshMainWindowId();
+  }
+  });
+}
+
+/**
+ * After a successful local operation, push the change to Supabase.
+ * Reads the current state from local storage and pushes it to Supabase
+ * so that other devices receive the change via Realtime.
+ */
+async function pushToSync(message: Message & { type: string }, responseData?: any) {
+  if (!syncClient || !syncUserId) return;
+
+  // Only the active device may push changes to Supabase. Query the DB
+  // directly — no cached flag — so we can never push from a device that
+  // has quietly lost the claim.
+  const { isActive } = await syncClient.isActiveDeviceFromDb();
+  if (!isActive) {
+    console.log(`[TabFlow] Skipping sync push (not active device per DB): ${message.type}`);
+    return;
+  }
+
+  // Second gate: only installs that have completed a claim (or have been
+  // locally verified as a pre-existing install) may push. Prevents a second
+  // browser from pushing before it has pulled from the cloud and set up.
+  if (!(await isSafeToPush())) {
+    console.log(`[TabFlow] Skipping sync push (safeToPush=false): ${message.type}`);
+    return;
+  }
+
+  try {
+    syncClient.setPushing(true);
+
+    switch (message.type) {
+      case 'CREATE_WORKSPACE': {
+        // Push the new workspace + push all workspaces (active states changed)
+        const allWorkspaces = await storage.getWorkspaces(LOCAL_USER_ID);
+        for (const ws of allWorkspaces) {
+          // Remap local userId to real Supabase userId for remote storage
+          await syncClient.pushWorkspace({ ...ws, userId: syncUserId });
+        }
+        // Push tabs for the old workspace (they were saved before switch).
+        // Exclude scroll — SAVE_SCROLL_POSITION is the sole scroll authority.
+        for (const ws of allWorkspaces) {
+          const tabs = await storage.getTabs(ws.id);
+          for (const tab of tabs) {
+            await syncClient.pushTab(tab, { excludeScroll: true });
+          }
+        }
+        break;
+      }
+
+      case 'DELETE_WORKSPACE': {
+        const { workspaceId } = message.payload || {};
+        if (workspaceId) {
+          await syncClient.deleteWorkspace(workspaceId);
+          // Also delete all tabs for this workspace remotely
+          // (They should already be deleted locally by the engine)
+        }
+        // Push updated active states for remaining workspaces
+        const remaining = await storage.getWorkspaces(LOCAL_USER_ID);
+        for (const ws of remaining) {
+          await syncClient.pushWorkspace({ ...ws, userId: syncUserId });
+        }
+        break;
+      }
+
+      case 'SWITCH_WORKSPACE': {
+        // Push all workspaces (active states changed) and all their tabs.
+        // Exclude scroll — SAVE_SCROLL_POSITION is the sole scroll authority.
+        const workspaces = await storage.getWorkspaces(LOCAL_USER_ID);
+        for (const ws of workspaces) {
+          await syncClient.pushWorkspace({ ...ws, userId: syncUserId });
+          const tabs = await storage.getTabs(ws.id);
+          for (const tab of tabs) {
+            await syncClient.pushTab(tab, { excludeScroll: true });
+          }
+        }
+        break;
+      }
+
+      case 'REMOVE_TAB': {
+        const { tabId } = message.payload || {};
+        if (tabId) {
+          await syncClient.deleteTab(tabId);
+        }
+        break;
+      }
+
+      case 'MOVE_TABS': {
+        // Delete old tab records remotely, then push all current tabs
+        const movedTabIds = message.payload?.tabIds || [];
+        for (const oldId of movedTabIds) {
+          await syncClient.deleteTab(oldId);
+        }
+        const allWs = await storage.getWorkspaces(LOCAL_USER_ID);
+        for (const ws of allWs) {
+          const wsTabs = await storage.getTabs(ws.id);
+          for (const tab of wsTabs) {
+            await syncClient.pushTab(tab, { excludeScroll: true });
+          }
+        }
+        break;
+      }
+
+      case 'RENAME_WORKSPACE':
+      case 'CHANGE_WORKSPACE_COLOR':
+      case 'REORDER_WORKSPACES': {
+        // Push all workspaces with updated names/colors/order
+        const updatedWorkspaces = await storage.getWorkspaces(LOCAL_USER_ID);
+        for (const ws of updatedWorkspaces) {
+          await syncClient.pushWorkspace({ ...ws, userId: syncUserId! });
+        }
+        break;
+      }
+
+      default:
+        // No sync needed for unrecognized operations
+        return;
+    }
+
+    console.log(`[TabFlow] Synced ${message.type} to Supabase`);
+  } catch (error) {
+    console.error('[TabFlow] Sync push error:', error);
+  } finally {
+    syncClient.setPushing(false);
+  }
+}
+
+// ─── SAFE-TO-PUSH GATE ────────────────────────────────────────────
+//
+// A second gate (in addition to isActiveDevice) that governs whether this
+// install is allowed to push anything to Supabase. The gate stops a freshly
+// installed browser from pushing its accidental window tabs (the Firefox
+// claim incident on 2026-04-15).
+//
+// Set to TRUE when:
+//   - An existing install is detected on first run (workspaces already in
+//     local IndexedDB AND sync credentials stored — the user has been
+//     using this install safely already).
+//   - CLAIM_ACTIVE_DEVICE completes materialization + verification.
+//   - RESTORE_FROM_CLOUD completes (explicit user-triggered pull).
+//
+// Set to FALSE (or never set):
+//   - Fresh install with empty IndexedDB.
+//   - Installs that have never successfully claimed as active device.
+//
+// Stored in chrome.storage.local under 'tabflow_safe_to_push'.
+
+const SAFE_TO_PUSH_KEY = 'tabflow_safe_to_push';
+
+async function isSafeToPush(): Promise<boolean> {
+  try {
+    const result = await chrome.storage.local.get(SAFE_TO_PUSH_KEY);
+    return result?.[SAFE_TO_PUSH_KEY] === true;
+  } catch {
+    return false;
+  }
+}
+
+async function markSafeToPush(reason: string): Promise<void> {
+  try {
+    await chrome.storage.local.set({ [SAFE_TO_PUSH_KEY]: true });
+    console.log(`[TabFlow] safeToPush = true (${reason})`);
+  } catch (err) {
+    console.warn('[TabFlow] Failed to persist safeToPush flag:', err);
+  }
+}
+
+/**
+ * One-shot migration for existing installs. If this install already has
+ * workspaces in local IndexedDB, assume it's a pre-existing good install
+ * and mark safeToPush = true. This ensures users who've been running
+ * TabFlow happily for weeks don't suddenly stop syncing when they update
+ * to this version.
+ *
+ * Fresh installs (empty IndexedDB) leave the flag unset — they can only
+ * push after a successful claim.
+ */
+async function maybeMigrateSafeToPush(): Promise<void> {
+  try {
+    const existing = await chrome.storage.local.get(SAFE_TO_PUSH_KEY);
+    if (existing?.[SAFE_TO_PUSH_KEY] === true) return;
+    const workspaces = await storage.getWorkspaces(LOCAL_USER_ID);
+    if (workspaces.length > 0) {
+      await markSafeToPush('migrated — existing install with local workspaces');
+    }
+  } catch (err) {
+    console.warn('[TabFlow] safeToPush migration skipped:', err);
+  }
+}
+
+// Run the migration once, shortly after startup (after IndexedDB is ready).
+setTimeout(() => { maybeMigrateSafeToPush(); }, 1500);
+
+// ─── SYNC FILTERING HELPERS ───────────────────────────────────────
+
+/**
+ * Determines whether a tab's URL is safe to push to cloud sync.
+ *
+ * Accepted: http, https, file, chrome://*, about:*
+ *   - chrome://* and about:* pages are stable, user-meaningful URLs
+ *     (chrome://extensions/, about:debugging, etc.). Each browser refuses
+ *     to open the OTHER browser's scheme, so the UI renders a
+ *     "Chrome only" / "Firefox only" badge on those tiles and catches the
+ *     "Illegal URL" rejection from tabs.create. Syncing them lets the user
+ *     keep these developer tiles in a shared workspace — the tile is a
+ *     live link on the matching browser and an inert placeholder on the
+ *     other.
+ *
+ * Rejected: moz-extension://, chrome-extension:// (loop back onto the
+ *   extension itself), edge://, vivaldi://, javascript:, data:, etc.
+ */
+function isSyncableTab(tab: { url: string }): boolean {
+  const url = tab.url || '';
+  if (!url) return false;
+  if (url.startsWith('http://') || url.startsWith('https://')) return true;
+  if (url.startsWith('file://')) return true;
+  if (url.startsWith('chrome://')) return true;
+  if (url.startsWith('about:')) return true;
+  return false;
+}
+
+/**
+ * Determines whether a favicon URL is safe to push to cloud sync.
+ * Browser-internal favicon URLs (chrome://global/..., resource://...)
+ * render as broken images when loaded on a different browser.
+ */
+function isSyncableFavicon(faviconUrl?: string): boolean {
+  if (!faviconUrl) return false;
+  if (faviconUrl.startsWith('data:')) return true;
+  if (faviconUrl.startsWith('http://') || faviconUrl.startsWith('https://')) return true;
+  return false;
+}
+
+// ─── THUMBNAIL CAPTURE ────────────────────────────────────────────
+// Lazily captures screenshots of tabs as the user visits them.
+// Thumbnails are stored as small JPEG data URLs in IndexedDB.
+
+/** Per-tab debounce timers for thumbnail capture */
+const thumbnailTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+/**
+ * Set of Chrome tab IDs currently being captured (prevent duplicate
+ * captures). 0.1.31: switched from URL-keyed to tab-ID-keyed so multiple
+ * tabs sharing a URL (e.g., several YouTube homepage tabs) don't block
+ * each other.
+ */
+const thumbnailCaptureInProgress = new Set<number>();
+
+/** URLs that should NOT be captured (internal pages, etc.) */
+function isCapturable(url: string): boolean {
+  if (!url) return false;
+  if (url.startsWith('chrome://') ||
+      url.startsWith('chrome-extension://') ||
+      url.startsWith('moz-extension://') ||
+      url.startsWith('about:') ||
+      url.startsWith('edge://') ||
+      url.startsWith('devtools://') ||
+      url.startsWith('data:') ||
+      url.startsWith('blob:')) return false;
+  return true;
+}
+
+/**
+ * Capture a thumbnail of the currently visible tab.
+ * Supports retry: if the first attempt fails, retries once after a delay.
+ *
+ * IMPORTANT: captureVisibleTab captures whatever is visible in the window,
+ * NOT a specific tab by ID. So the tab must still be active when we capture.
+ */
+async function captureTabThumbnail(tabId: number, retryCount = 0): Promise<void> {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.url || !tab.active || !tab.windowId) return;
+    if (!isCapturable(tab.url)) return;
+    if (tabManager.isTabFlowTab(tab)) return;
+    if (!isInMainWindow(tab.windowId)) return;
+
+    // Deduplicate concurrent captures for the same Chrome tab. Keyed by
+    // tab ID (not URL) so same-URL tabs don't block each other.
+    if (thumbnailCaptureInProgress.has(tabId)) return;
+    thumbnailCaptureInProgress.add(tabId);
+
+    try {
+      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: 'jpeg',
+        quality: 40,
+      });
+
+      // Resolve the storage record for THIS chrome tab via TabManager's
+      // tab-ID -> storage-ID cache, which is kept fresh by every
+      // saveCurrentTabsToWorkspace snapshot. This replaces the prior
+      // position-among-same-URL re-derivation, which silently failed
+      // when canonical-URL filtering didn't line up with the snapshot's
+      // matching at capture time.
+      try {
+        let storageId = tabManager.getStorageIdForTab(tabId);
+
+        if (!storageId) {
+          // Fallback safety net: cache may be stale (snapshot hasn't run
+          // since the tab was opened). Redo position-among-same-URL
+          // matching as a one-time fallback. Log loudly so we can spot
+          // recurring misses in the field.
+          console.warn(`[TabFlow] Thumbnail cache miss for chrome tab ${tabId}, falling back to position-match`);
+          const activeWs = (await workspaceEngine.getWorkspaces(LOCAL_USER_ID))
+            .find((ws) => ws.isActive);
+          if (activeWs) {
+            const storedTabs = await storage.getTabs(activeWs.id);
+            const canonical = canonicalizeUrl(tab.url || '');
+            const sameUrlStored = storedTabs
+              .filter((t) => canonicalizeUrl(t.url) === canonical)
+              .sort((a, b) => {
+                const aT = (a.createdAt ?? a.updatedAt) as Date;
+                const bT = (b.createdAt ?? b.updatedAt) as Date;
+                return new Date(aT).getTime() - new Date(bT).getTime();
+              });
+            const winTabs = await chrome.tabs.query({ windowId: tab.windowId });
+            const sameUrlChrome = winTabs
+              .filter((t) => canonicalizeUrl(t.url || '') === canonical)
+              .sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+            const positionAmongSameUrl = sameUrlChrome.findIndex((t) => t.id === tab.id);
+            const match = positionAmongSameUrl >= 0 ? sameUrlStored[positionAmongSameUrl] : undefined;
+            if (match) storageId = match.id;
+          }
+        }
+
+        if (storageId) {
+          await storage.saveThumbnail(storageId, dataUrl);
+        } else {
+          console.warn(`[TabFlow] Thumbnail captured but no storage record found for chrome tab ${tabId}`);
+        }
+      } catch (saveErr) {
+        console.warn('[TabFlow] Could not associate thumbnail with storage tab:', saveErr);
+      }
+      console.log(`[TabFlow] Thumbnail captured: ${tab.url.substring(0, 80)}`);
+    } catch (captureErr: any) {
+      const msg = captureErr?.message || String(captureErr);
+      // 0.1.31: retry once after 500ms for transient errors, but skip
+      // retry for permission errors or tab-gone errors (those won't
+      // recover).
+      const isPermissionErr = msg.toLowerCase().includes('permission');
+      const isTabGoneErr = msg.toLowerCase().includes('no longer exists') ||
+                           msg.toLowerCase().includes('no tab with id');
+      if (retryCount === 0 && !isPermissionErr && !isTabGoneErr) {
+        console.log(`[TabFlow] Thumbnail capture failed (will retry in 500ms): ${msg.substring(0, 80)}`);
+        setTimeout(() => captureTabThumbnail(tabId, 1), 500);
+      } else {
+        console.log(`[TabFlow] Thumbnail capture failed: ${msg.substring(0, 80)} — ${tab.url.substring(0, 60)}`);
+      }
+    } finally {
+      thumbnailCaptureInProgress.delete(tabId);
+    }
+  } catch {
+    // Tab may have been closed
+  }
+}
+
+/**
+ * Schedule a thumbnail capture for a specific tab with per-tab debouncing.
+ *
+ * `immediate: true` (default false): fire NOW. Used for onActivated —
+ * the user just clicked the tab, the page is already rendered enough,
+ * and any debounce would cause the capture to miss because the user
+ * may click another tab before the timer fires (the tab is then no
+ * longer active, captureVisibleTab can't see it, capture silently
+ * fails).
+ *
+ * Default (debounced): 300ms delay. Used for onUpdated 'complete' so
+ * we let one more layout pass settle before capturing.
+ */
+function scheduleThumbnailCapture(
+  tabId: number,
+  opts: { immediate?: boolean } = {},
+): void {
+  // Clear any existing timer for this specific tab
+  const existing = thumbnailTimers.get(tabId);
+  if (existing) clearTimeout(existing);
+
+  if (opts.immediate) {
+    // Fire NOW — don't debounce. The user just activated this tab.
+    captureTabThumbnail(tabId);
+    return;
+  }
+
+  const timer = setTimeout(() => {
+    thumbnailTimers.delete(tabId);
+    captureTabThumbnail(tabId);
+  }, 300);
+
+  thumbnailTimers.set(tabId, timer);
+}
+
+// ─── THUMBNAIL BULK BACKFILL ──────────────────────────────────────
+// After a workspace switch completes, run a background pass that
+// briefly activates each tab in the new workspace which doesn't yet
+// have a thumbnail. ~250ms per tab. Restores focus to the originally-
+// active tab when done. Cancelled aggressively if the user interacts.
+
+/** True while a thumbnail backfill is iterating tabs in the background.
+ *  Tab event listeners check this alongside isSwitchingWorkspaces /
+ *  isGateSetSync() so our own activations don't trigger snapshot
+ *  writes or workspace switches. */
+let isBackfillingThumbnails = false;
+
+/** Incrementing token used to cancel an in-flight backfill when a new
+ *  one is requested. The iteration loop bails when `currentBackfillToken
+ *  !== myToken`. */
+let currentBackfillToken = 0;
+
+async function backfillThumbnails(workspaceId: string): Promise<void> {
+  // 0.1.34: backfill now runs INSIDE workspace switch / startup reconcile /
+  // claim materialization, so the system-operation gate WILL be set during
+  // this call. We no longer entry-guard on isSwitchingWorkspaces /
+  // isGateSetSync; cancellation is via the per-call myToken below.
+  const myToken = ++currentBackfillToken;
+
+  try {
+    // Confirm the workspace is still active. If the user has switched
+    // away in the 1s before this function runs, give up.
+    const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+    const activeWs = workspaces.find((ws) => ws.isActive);
+    if (!activeWs || activeWs.id !== workspaceId) return;
+
+    const mainWindowId = cachedMainWindowId ?? await tabManager.getMainWindowId();
+    if (mainWindowId === undefined) return;
+
+    // Find the originally-active tab in the main window so we can
+    // restore focus to it when done.
+    const originalActiveTabs = await chrome.tabs.query({ windowId: mainWindowId, active: true });
+    const originalActiveTabId = originalActiveTabs[0]?.id;
+    if (originalActiveTabId === undefined) return;
+
+    // Gather candidates: storage records that lack a thumbnail AND
+    // have a known Chrome tab that is loaded, http(s), and capturable.
+    const storedTabs = await storage.getTabs(workspaceId);
+    if (storedTabs.length === 0) return;
+
+    const existingThumbs = await storage.getThumbnails(storedTabs.map((t) => t.id));
+
+    const candidates: { storageId: string; chromeTabId: number }[] = [];
+    for (const stored of storedTabs) {
+      if (existingThumbs[stored.id]) continue; // already have one — skip
+      const chromeTabId = tabManager.getChromeTabIdForStorageId(stored.id);
+      if (chromeTabId === null) continue;
+      try {
+        const chromeTab = await chrome.tabs.get(chromeTabId);
+        if (chromeTab.status !== 'complete') continue;
+        if (!chromeTab.url) continue;
+        if (!isCapturable(chromeTab.url)) continue;
+        if (chromeTab.url.startsWith(`${getExtensionBaseUrl()}suspended.html`)) continue;
+        if (tabManager.isTabFlowTab(chromeTab)) continue;
+        if (chromeTab.windowId !== mainWindowId) continue;
+        candidates.push({ storageId: stored.id, chromeTabId });
+      } catch {
+        // tab not found — skip
+      }
+    }
+
+    if (candidates.length === 0) return;
+
+    console.log(`[TabFlow] backfillThumbnails: ${candidates.length} candidate tabs in workspace ${workspaceId}`);
+
+    isBackfillingThumbnails = true;
+    // We expect the active tab in the main window to be the tab WE
+    // last activated. Used to detect user interference (the user
+    // clicked a tab in the strip while we were iterating).
+    let expectedActiveTabId: number = originalActiveTabId;
+
+    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+    try {
+      for (const { chromeTabId } of candidates) {
+        // CANCELLATION: a newer backfill (e.g. user started another
+        // workspace switch which queued behind this operation) wins.
+        if (currentBackfillToken !== myToken) {
+          console.log('[TabFlow] backfillThumbnails: superseded by a newer backfill, exiting');
+          break;
+        }
+        // Modal is up — user can't click tab cards in TabFlow. But they
+        // could still click a tab in the browser's native tab strip,
+        // and we should yield if they do.
+        try {
+          const activeNow = (await chrome.tabs.query({ windowId: mainWindowId, active: true }))[0];
+          if (activeNow?.id !== undefined && activeNow.id !== expectedActiveTabId) {
+            console.log(`[TabFlow] backfillThumbnails: user activated a different tab (${activeNow.id} vs expected ${expectedActiveTabId}), exiting`);
+            break;
+          }
+        } catch {
+          break;
+        }
+
+        // Activate the candidate tab so captureVisibleTab can see it.
+        try {
+          await chrome.tabs.update(chromeTabId, { active: true });
+          expectedActiveTabId = chromeTabId;
+        } catch {
+          // Tab may have been closed; skip
+          continue;
+        }
+
+        // 0.1.34: tightened to ~400ms total per tab (200ms activate
+        // settle + capture + 200ms post). Down from ~500ms in 0.1.31.
+        await sleep(200);
+
+        if (currentBackfillToken !== myToken) break;
+
+        try {
+          await captureTabThumbnail(chromeTabId);
+        } catch (err) {
+          // captureTabThumbnail itself swallows most errors; this is
+          // defensive only.
+          console.warn('[TabFlow] backfillThumbnails: capture threw:', err);
+        }
+
+        await sleep(200);
+      }
+    } finally {
+      // Restore focus to the originally-active tab.
+      try {
+        const finalActive = (await chrome.tabs.query({ windowId: mainWindowId, active: true }))[0];
+        if (finalActive?.id !== originalActiveTabId) {
+          try {
+            await chrome.tabs.update(originalActiveTabId, { active: true });
+          } catch {
+            // Original tab may have been closed during the pass
+          }
+        }
+      } catch {
+        // Non-critical
+      }
+      isBackfillingThumbnails = false;
+      console.log(`[TabFlow] backfillThumbnails: done for workspace ${workspaceId}`);
+    }
+  } catch (err) {
+    isBackfillingThumbnails = false;
+    console.error('[TabFlow] backfillThumbnails: error', err);
+  }
+}
+
+/**
+ * Capture thumbnails for tabs that were recently restored (e.g., after
+ * workspace switch). Since captureVisibleTab can only capture the active tab,
+ * this only captures the currently-active tab if it doesn't have a thumbnail.
+ * Other tabs will get thumbnails as the user visits them naturally.
+ */
+async function captureActiveIfMissing(): Promise<void> {
+  if (isSwitchingWorkspaces || isStartingUp || isGateSetSync()) return;
+
+  try {
+    const mainWindowId = cachedMainWindowId ?? await tabManager.getMainWindowId();
+    if (mainWindowId === undefined) return;
+
+    const activeTabs = await chrome.tabs.query({ windowId: mainWindowId, active: true });
+    const activeTab = activeTabs[0];
+    if (!activeTab?.url || !activeTab.id || !isCapturable(activeTab.url)) return;
+    if (tabManager.isTabFlowTab(activeTab)) return;
+
+    // Check if we already have a thumbnail for this URL
+    const existing = await storage.getThumbnail(activeTab.url);
+    if (existing) return;
+
+    // Wait a moment for the page to render, then capture
+    setTimeout(() => captureTabThumbnail(activeTab.id!), 2000);
+  } catch {
+    // Non-critical
+  }
+}
+
+/**
+ * Tab event listeners — LOCKED-DOWN approach with smart save triggers.
+ *
+ * PRINCIPLE: The database ONLY changes via atomic snapshots triggered by
+ * user actions. Individual tab events do NOT write individual records.
+ * Instead, specific user actions trigger a full saveCurrentTabsToWorkspace
+ * snapshot that replaces ALL chrome-* records with what's actually in Chrome.
+ *
+ * Save triggers (all user-initiated):
+ * - Workspace switch (in MessageHandler)
+ * - Tab activated (user clicks a different tab)
+ * - Tab closed (user closes a tab)
+ * - TabFlow tab activated (user clicks the TabFlow pinned tab)
+ *
+ * Each trigger calls snapshotActiveWorkspace() which does ONE atomic
+ * saveCurrentTabsToWorkspace call. This is safe because it only captures
+ * what's currently in Chrome — it never creates phantom data.
+ */
+
+/**
+ * Debounced snapshot of the active workspace's tabs.
+ * Multiple rapid events (e.g., closing several tabs) only trigger one save.
+ */
+let snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+let snapshotInProgress = false;
+
+async function snapshotActiveWorkspace(): Promise<void> {
+  // Debounce: wait 500ms after the last trigger before saving
+  if (snapshotTimer) clearTimeout(snapshotTimer);
+
+  snapshotTimer = setTimeout(async () => {
+    if (snapshotInProgress || isStartingUp || isSwitchingWorkspaces || isGateSetSync() || isBackfillingThumbnails) return;
+    snapshotInProgress = true;
+
+    try {
+      const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+      const activeWorkspace = workspaces.find((ws) => ws.isActive);
+      if (!activeWorkspace) return;
+
+      const mainWindowId = cachedMainWindowId ?? await tabManager.getMainWindowId();
+      if (mainWindowId === undefined) return;
+
+      const { deletedTabIds } = await tabManager.saveCurrentTabsToWorkspace(activeWorkspace.id, storage, mainWindowId);
+      broadcastSyncUpdate();
+
+      // Save a history entry if the tab URLs have changed since the last one.
+      // This enables the "rewind" feature without storing redundant snapshots.
+      try {
+        const currentTabs = await storage.getTabs(activeWorkspace.id);
+        const currentUrls = currentTabs
+          .map((t) => t.url)
+          .filter(Boolean)
+          .sort()
+          .join('\n');
+
+        const lastEntry = await storage.getLatestHistoryEntry(activeWorkspace.id);
+        const lastUrls = lastEntry
+          ? lastEntry.tabs.map((t) => t.url).filter(Boolean).sort().join('\n')
+          : '';
+
+        if (currentUrls !== lastUrls) {
+          const historyEntry = {
+            id: crypto.randomUUID(),
+            workspaceId: activeWorkspace.id,
+            timestamp: new Date(),
+            tabs: currentTabs.map((t) => ({
+              url: t.url,
+              title: t.title,
+              faviconUrl: t.faviconUrl,
+              sortOrder: t.sortOrder,
+              isPinned: t.isPinned,
+            })),
+          };
+          await storage.saveHistoryEntry(historyEntry);
+          console.log(`[TabFlow] History entry saved for "${activeWorkspace.name}" (${currentTabs.length} tabs)`);
+
+          // 0.1.37: also push to Supabase so history follows the user
+          // across devices. Same gates as snapshot push: active device per
+          // DB + safeToPush. Non-fatal — a cloud failure shouldn't break
+          // the local snapshot path.
+          if (syncClient && syncUserId) {
+            try {
+              const { isActive: histActive } = await syncClient.isActiveDeviceFromDb();
+              if (histActive && (await isSafeToPush())) {
+                syncClient.setPushing(true);
+                try {
+                  await syncClient.pushHistoryEntry(historyEntry, syncUserId);
+                  syncClient.pruneOldHistory(syncUserId).catch(() => {});
+                } finally {
+                  syncClient.setPushing(false);
+                }
+              }
+            } catch (cloudHistErr) {
+              console.warn('[TabFlow] Failed to push history entry to cloud (non-fatal):', cloudHistErr);
+            }
+          }
+        }
+      } catch (histErr) {
+        // History is non-critical — don't let it break snapshots
+        console.warn('[TabFlow] Error saving history entry:', histErr);
+      }
+
+      console.log(`[TabFlow] Snapshot saved for workspace "${activeWorkspace.name}"`);
+
+      // Push the snapshot to Supabase so the cloud always reflects what
+      // the active browser is doing. Both gates (DB active-device check +
+      // safeToPush) must pass — a second browser that hasn't claimed yet
+      // can't push. The active-device check round-trips to Supabase on
+      // every snapshot; the database is the single source of truth.
+      const pushActiveCheck = syncClient && syncUserId
+        ? (await syncClient.isActiveDeviceFromDb()).isActive
+        : false;
+      if (syncClient && syncUserId && pushActiveCheck && (await isSafeToPush())) {
+        try {
+          syncClient.setPushing(true);
+          await syncClient.pushWorkspace({ ...activeWorkspace, userId: syncUserId });
+          // Push tabs WITHOUT scroll values. Scroll sync is handled
+          // exclusively by the SAVE_SCROLL_POSITION handler, which pushes
+          // individual scroll updates to Supabase in real time. Including
+          // scroll in this batch push creates a race: the batch reads tabs
+          // at time T, but pushes them one-by-one over several seconds —
+          // if SAVE_SCROLL_POSITION updates Supabase at time T+1, this
+          // loop would overwrite it at time T+2 with the stale value.
+          const freshTabs = await storage.getTabs(activeWorkspace.id);
+          // Parallelize. The previous sequential `for await` loop took
+          // ~500ms × N tabs (~5-6s for an 11-tab workspace) — long enough
+          // that if the user navigated away or closed the browser shortly
+          // after a youtube-time-tracker URL update, the new `&t=Ns`
+          // value never reached Supabase. PC2's "Resume Working Here"
+          // would then pull a stale URL and resume mid-video. Concurrent
+          // pushes cut total wall time to roughly one round-trip
+          // (~500ms) regardless of tab count, and allSettled means one
+          // failed row doesn't abort the rest.
+          await Promise.allSettled(
+            freshTabs.map((tab) => syncClient!.pushTab(tab, { excludeScroll: true }))
+          );
+          // STRICT CLOUD MIRROR (0.1.18): after upserting local tabs, query
+          // cloud for the active workspace's tab IDs and delete any that
+          // aren't in local. Without this, cloud accumulates orphan rows
+          // forever — past bugs/races leave behind ghost rows that
+          // upserts can't clean up (they only update or insert by ID).
+          // The result was Sam seeing wrong tabs from another workspace
+          // mixed into his active workspace after Resume Working Here,
+          // because Resume's destructive pull faithfully reproduces the
+          // dirty cloud state.
+          //
+          // Per-workspace cleanup (not whole-DB) because the snapshot
+          // only knows the active workspace's intended state. Other
+          // workspaces get cleaned when they become active.
+          const localTabIdSet = new Set(freshTabs.map((t) => t.id));
+          // Also include any IDs the snapshot's local cleanup deleted —
+          // they shouldn't be in cloud either. Belt-and-suspenders.
+          for (const id of deletedTabIds) localTabIdSet.delete(id);
+          try {
+            const cloudIds = await syncClient!.getTabIdsForWorkspace(activeWorkspace.id, syncUserId);
+            const orphans = cloudIds.filter((id) => !localTabIdSet.has(id));
+            if (orphans.length > 0) {
+              await Promise.allSettled(orphans.map((id) => syncClient!.deleteTab(id)));
+              console.log(`[TabFlow] Snapshot push: cleaned ${orphans.length} cloud orphan(s) from "${activeWorkspace.name}"`);
+            }
+          } catch (cleanupErr) {
+            console.warn('[TabFlow] Per-workspace orphan cleanup failed (non-fatal):', cleanupErr);
+          }
+          // Also delete the explicit deletedTabIds (snapshot's local cleanup).
+          // Largely redundant with the cloud-orphan sweep above, but kept as
+          // a fast path for the common case.
+          if (deletedTabIds.length > 0) {
+            await Promise.allSettled(
+              deletedTabIds.map((id) => syncClient!.deleteTab(id))
+            );
+            console.log(`[TabFlow] Deleted ${deletedTabIds.length} orphaned cloud tabs`);
+          }
+          console.log(`[TabFlow] Snapshot pushed to cloud for "${activeWorkspace.name}"`);
+        } catch (pushErr) {
+          console.warn('[TabFlow] Snapshot push failed (non-fatal):', pushErr);
+        } finally {
+          syncClient.setPushing(false);
+        }
+      }
+    } catch (error) {
+      console.error('[TabFlow] Error in snapshot save:', error);
+    } finally {
+      snapshotInProgress = false;
+    }
+  }, 500);
+}
+
+/**
+ * Final reconcile step called at the end of each system operation, before
+ * the SystemOperationGate clears. Settles briefly so any pending
+ * chrome.tabs events from the operation can land, then runs a single
+ * `saveCurrentTabsToWorkspace` against the active workspace.
+ *
+ * Catches two cases the prior pattern missed:
+ *   1. Tabs the operation opened that hadn't fully registered when the
+ *      operation's main body returned.
+ *   2. Any user actions during the operation (legitimate intent that
+ *      the gate suppressed by design).
+ *
+ * Phase 2 of the gate-hardening refactor. Runs INSIDE the
+ * runSystemOperation body so the gate is still set — that means this
+ * single reconcile is the only DB write that observes the operation's
+ * end state, and no other snapshot can race it.
+ */
+async function finalReconcile(workspaceId: string, operationName: string): Promise<void> {
+  try {
+    // Brief settle so any pending chrome.tabs events from the operation
+    // can land and chrome.tabs.query reflects current truth.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const mainWindowId = cachedMainWindowId ?? await tabManager.getMainWindowId();
+    if (mainWindowId === undefined) {
+      console.warn(`[TabFlow] finalReconcile(${operationName}): no main window; skipping`);
+      return;
+    }
+
+    // Use the existing snapshot path. This writes the workspace's tabs
+    // to IndexedDB and pushes to Supabase if active.
+    await tabManager.saveCurrentTabsToWorkspace(workspaceId, storage, mainWindowId);
+    console.log(`[TabFlow] finalReconcile(${operationName}): workspace ${workspaceId} reconciled`);
+  } catch (err) {
+    // Don't let reconcile failures break the operation result.
+    console.error(`[TabFlow] finalReconcile(${operationName}): error`, err);
+  }
+}
+
+chrome.tabs.onCreated.addListener(async (tab) => {
+  if (isStartingUp || isSwitchingWorkspaces || isGateSetSync() || isBackfillingThumbnails) return;
+  if (!isInMainWindow(tab.windowId)) return;
+
+  // A new tab was opened — snapshot so it appears in the database
+  snapshotActiveWorkspace();
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
+  // 0.1.38: prune pipActiveTabs entry for this tab regardless of any
+  // gating — a closed tab has no video to be PIP-ing, and the entry
+  // would otherwise leak until SW restart.
+  // 0.1.40: persist the pruned Set so session storage stays in sync.
+  if (pipActiveTabs.delete(tabId)) {
+    persistPipActiveTabs();
+  }
+
+  if (isStartingUp || isSwitchingWorkspaces || isGateSetSync() || isBackfillingThumbnails) return;
+
+  // CRITICAL: When Chrome is shutting down, don't modify storage.
+  if (removeInfo.isWindowClosing) {
+    console.log(`[TabFlow] Skipping tab removal ${tabId} — window is closing`);
+    return;
+  }
+
+  if (!isInMainWindow(removeInfo.windowId)) return;
+
+  // User closed a tab — snapshot to update the database
+  snapshotActiveWorkspace();
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (isStartingUp || isSwitchingWorkspaces || isGateSetSync() || isBackfillingThumbnails) return;
+  if (!isInMainWindow(tab.windowId)) return;
+
+  // Only snapshot on meaningful changes (URL change or page load complete)
+  if (changeInfo.url || changeInfo.status === 'complete') {
+    snapshotActiveWorkspace();
+  }
+
+  // Capture thumbnail when page finishes loading (if tab is active)
+  // Debounced 300ms to let layout settle after load.
+  if (changeInfo.status === 'complete' && tab.active) {
+    scheduleThumbnailCapture(tabId);
+  }
+});
+
+chrome.tabs.onMoved.addListener(async (tabId, moveInfo) => {
+  if (isStartingUp || isSwitchingWorkspaces || isGateSetSync() || isBackfillingThumbnails) return;
+  if (!isInMainWindow(moveInfo.windowId)) return;
+
+  // User reordered tabs — snapshot to update sort order
+  snapshotActiveWorkspace();
+});
+
+chrome.tabs.onAttached.addListener(async (tabId, attachInfo) => {
+  if (isStartingUp || isSwitchingWorkspaces || isGateSetSync() || isBackfillingThumbnails) return;
+  if (!isInMainWindow(attachInfo.newWindowId)) return;
+
+  // Tab dragged into main window — snapshot
+  snapshotActiveWorkspace();
+});
+
+/**
+ * Auto-load suspended tabs when the user clicks on them.
+ * Also triggers a snapshot on tab activation (user is interacting).
+ */
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  try {
+    // Skip enforceTabLock if the activated tab IS the TabFlow tab — this
+    // prevents a redirect loop where each redirect triggers onActivated.
+    const tfStored = await chrome.storage.local.get('tabFlowTabId');
+    if (activeInfo.tabId !== tfStored.tabFlowTabId) {
+      // If this device is NOT the active device, force the user back to the
+      // pinned TabFlow tab so they must click "Resume Working Here" first.
+      await enforceTabLock();
+    }
+
+    const tab = await chrome.tabs.get(activeInfo.tabId);
+
+    // Auto-load suspended tabs
+    const suspendedPrefix = `${getExtensionBaseUrl()}suspended.html`;
+    if (tab.url?.startsWith(suspendedPrefix)) {
+      const params = new URL(tab.url).searchParams;
+      const realUrl = params.get('url');
+      if (realUrl) {
+        console.log(`[TabFlow] Activating suspended tab → ${realUrl}`);
+        await chrome.tabs.update(activeInfo.tabId, { url: realUrl });
+      }
+    }
+
+    // Track last active tab per workspace and trigger snapshot
+    if (!isStartingUp && !isSwitchingWorkspaces && !isGateSetSync() && !isBackfillingThumbnails && !tabManager.isTabFlowTab(tab)) {
+      if (isInMainWindow(tab.windowId)) {
+        try {
+          const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+          const activeWorkspace = workspaces.find((ws) => ws.isActive);
+          if (activeWorkspace) {
+            await chrome.storage.local.set({
+              [`lastActiveTab_${activeWorkspace.id}`]: activeInfo.tabId,
+            });
+          }
+        } catch {
+          // Non-critical
+        }
+
+        // User clicked a tab — snapshot to keep DB fresh
+        snapshotActiveWorkspace();
+
+        // Schedule thumbnail capture for the newly activated tab.
+        // FIRE IMMEDIATELY: the user just activated this tab; any debounce
+        // risks the tab no longer being active (user moves on) by the time
+        // the timer expires, which makes captureVisibleTab silently miss.
+        scheduleThumbnailCapture(activeInfo.tabId, { immediate: true });
+      }
+    }
+  } catch (error) {
+    // Tab may have been closed already
+  }
+});
+
+/**
+ * Detect external un-minimization of a hidden workspace window and
+ * auto-switch to that workspace.
+ */
+chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  try {
+    if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+    if (isStartingUp || isSwitchingWorkspaces || isGateSetSync() || isBackfillingThumbnails) return;
+    if (windowId === cachedMainWindowId) return;
+
+    const targetWorkspaceId = await tabManager.getWorkspaceForHiddenWindow(windowId);
+    if (!targetWorkspaceId) return;
+
+    // Defensive: don't switch to the workspace we're already on
+    const workspaces = await workspaceEngine.getWorkspaces(LOCAL_USER_ID);
+    const activeWorkspace = workspaces.find((ws) => ws.isActive);
+    if (activeWorkspace && activeWorkspace.id === targetWorkspaceId) return;
+
+    console.log(
+      `[TabFlow] Hidden workspace window ${windowId} (workspace ${targetWorkspaceId}) was focused externally — auto-switching`
+    );
+
+    // Route through the same handler the UI uses — gets the gate,
+    // finalReconcile, and all other invariants for free.
+    const response = await messageHandler.handleMessage({
+      type: MessageType.SWITCH_WORKSPACE,
+      payload: { workspaceId: targetWorkspaceId },
+    } as Message);
+
+    if (!response?.success) {
+      console.warn(
+        `[TabFlow] Auto-switch to workspace ${targetWorkspaceId} failed:`,
+        response?.error
+      );
+    }
+  } catch (error) {
+    console.error('[TabFlow] Error handling onFocusChanged auto-switch:', error);
+  }
+});
+
+/**
+ * 0.1.38: Browser-close cleanup.
+ *
+ * Hidden minimized workspace windows (used to preserve PIP across switches)
+ * are otherwise invisible to the user but keep the browser process alive
+ * when the user clicks X on the visible window. Without this listener,
+ * Firefox stays running with 8+ GB of memory and the user thinks they
+ * closed the browser but didn't.
+ *
+ * When a window closes, check if any non-hidden, non-minimized windows
+ * remain. If none, close all remaining hidden workspace windows so the
+ * browser process can actually exit. Defensive: wrapped in try/catch so
+ * the listener can never throw and crash the SW.
+ */
+chrome.windows.onRemoved.addListener(async (closedWindowId) => {
+  try {
+    // Fetch the hidden-window map first so we know which IDs are ours.
+    const stored = await chrome.storage.local.get('hiddenWindows');
+    const hiddenMap: Record<string, number> = stored?.hiddenWindows ?? {};
+    const hiddenWindowIds = new Set<number>(Object.values(hiddenMap));
+
+    // Drop the closed window from the hidden map if it was one of ours.
+    // (Firefox may close hidden windows on its own if the user manually
+    // restores then closes them via Window Manager.)
+    let mutated = false;
+    for (const [wsId, winId] of Object.entries(hiddenMap)) {
+      if (winId === closedWindowId) {
+        delete hiddenMap[wsId];
+        hiddenWindowIds.delete(winId);
+        mutated = true;
+      }
+    }
+
+    // Enumerate remaining windows.
+    let remainingWindows: chrome.windows.Window[] = [];
+    try {
+      remainingWindows = await chrome.windows.getAll({ populate: false });
+    } catch (err) {
+      console.warn('[TabFlow] onWindowRemoved: chrome.windows.getAll failed:', err);
+      // If we can't enumerate, save any mutations we made and bail.
+      if (mutated) {
+        await chrome.storage.local.set({ hiddenWindows: hiddenMap });
+      }
+      return;
+    }
+
+    // "Visible" = anything not in our hidden-window map AND not minimized.
+    // The browser-managed minimized states should still be respected; we
+    // only close OUR hidden tool-windows here.
+    const visibleRemaining = remainingWindows.filter(
+      (w) => w.id !== undefined && !hiddenWindowIds.has(w.id) && w.state !== 'minimized'
+    );
+
+    if (visibleRemaining.length === 0 && hiddenWindowIds.size > 0) {
+      console.log(
+        `[TabFlow] Last visible window closed — closing ${hiddenWindowIds.size} hidden workspace window(s) so the browser can exit`
+      );
+      for (const hiddenId of hiddenWindowIds) {
+        try {
+          await chrome.windows.remove(hiddenId);
+        } catch (err) {
+          console.warn(`[TabFlow] Failed to close hidden window ${hiddenId}:`, err);
+        }
+      }
+      // Clear the map; everything that was in it is now closed.
+      await chrome.storage.local.set({ hiddenWindows: {} });
+    } else if (mutated) {
+      // Persist the smaller map if we removed an entry above but other
+      // visible windows remain (no bulk close).
+      await chrome.storage.local.set({ hiddenWindows: hiddenMap });
+    }
+  } catch (err) {
+    console.error('[TabFlow] onWindowRemoved handler error:', err);
+  }
+});
+
+export {};

@@ -14,6 +14,7 @@
 import React, { useState } from 'react';
 import type { Tab } from '@tabflow/core';
 import { styles } from './styles';
+import { crossBrowserOnlyLabel, isFirefox, isUrlOpenable } from '../browser-compat';
 
 export interface TabCardProps {
   tab: Tab;
@@ -23,9 +24,24 @@ export interface TabCardProps {
   onToggleSelect: () => void;
   onClick: () => void;
   onRemove: () => void;
+  /**
+   * 0.1.46: toggle callback for the "keep alive across workspace switches"
+   * checkbox. Fires with the desired next value. Optional so older callers
+   * that don't wire it up still compile — but without it the checkbox is
+   * effectively read-only (still renders for visual consistency).
+   */
+  /**
+   * 0.1.57: 'disabled' now only controls the visual dim / cursor while a
+   * system operation is in flight. The pushpin was removed in favor of
+   * the pre-switch prompt modal, so no per-tab checkbox needs disabling.
+   * Kept for backward compatibility with the caller.
+   * Previous doc (0.1.46): force the persistent checkbox into a disabled state
+   * API doesn't exist.
+   */
+  disabled?: boolean;
 }
 
-export const TabCard: React.FC<TabCardProps> = ({ tab, accentColor, selected, thumbnailUrl, onToggleSelect, onClick, onRemove }) => {
+export const TabCard: React.FC<TabCardProps> = ({ tab, accentColor, selected, thumbnailUrl, onToggleSelect, onClick, onRemove, disabled }) => {
   const [hover, setHover] = useState(false);
   const [pressed, setPressed] = useState(false);
   const [thumbError, setThumbError] = useState(false);
@@ -45,6 +61,13 @@ export const TabCard: React.FC<TabCardProps> = ({ tab, accentColor, selected, th
   };
 
   const showThumbnail = thumbnailUrl && !thumbError;
+
+  // Cross-browser badge: if this tile's URL is privileged for a browser other
+  // than the current one (chrome://* on Firefox, about:* on Chrome), show a
+  // small "CHROME ONLY" / "FIREFOX ONLY" chip in the top-right corner. The
+  // tile still renders its favicon/title/url; clicking it fires a toast via
+  // `handleOpenTab` in NewTab.tsx instead of throwing an "Illegal URL" error.
+  const inertLabel = !isUrlOpenable(tab.url) ? crossBrowserOnlyLabel(tab.url) : null;
 
   // Backlit glow effect:
   // - No hover: no glow (tile flat, dark)
@@ -95,6 +118,7 @@ export const TabCard: React.FC<TabCardProps> = ({ tab, accentColor, selected, th
         ...(hover ? styles.tabCardHover : {}),
         ...glowStyle,
         ...(selected ? { outline: `2px solid ${accentColor}`, outlineOffset: '-2px' } : {}),
+        ...(inertLabel ? { opacity: 0.65 } : {}),
       }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => { setHover(false); setPressed(false); }}
@@ -105,6 +129,12 @@ export const TabCard: React.FC<TabCardProps> = ({ tab, accentColor, selected, th
       onMouseUp={() => setPressed(false)}
       onClick={onClick}
     >
+      {inertLabel && (
+        <div style={styles.crossBrowserBadge} title={`This link only opens in ${inertLabel}.`}>
+          {inertLabel} only
+        </div>
+      )}
+
       {/* Thumbnail preview area */}
       <div style={styles.tabThumbnailArea}>
         {showThumbnail ? (
@@ -142,6 +172,12 @@ export const TabCard: React.FC<TabCardProps> = ({ tab, accentColor, selected, th
             style={styles.tabCheckbox}
             title="Select tab"
           />
+          {/* 0.1.57: Pushpin removed. Persistent-tab preservation is now
+              handled by the pre-switch prompt modal, which appears
+              automatically when audible or previously-preserved tabs
+              are present. See handleGetTabsToPromptForSwitch in the
+              MessageHandler. */}
+          <div style={{ flex: 1 }} />
           <button
             style={{
               ...styles.tabRemoveButton,
